@@ -1,0 +1,41 @@
+{
+  "name": "agent-index-filesystem-onedrive",
+  "display_name": "Microsoft OneDrive / SharePoint",
+  "version": "1.0.0",
+  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries",
+  "author": "agent-index",
+  "license": "proprietary",
+  "core_version": "1.0.0",
+  "backend_id": "onedrive",
+  "auth_method": "oauth2",
+  "connection_schema": {
+    "drive_id": {
+      "type": "string",
+      "required": false,
+      "description": "OneDrive or SharePoint document library drive ID. Omit for user's default drive."
+    },
+    "site_id": {
+      "type": "string",
+      "required": false,
+      "description": "SharePoint site ID. Required for SharePoint document libraries, omit for personal OneDrive."
+    },
+    "tenant_id": {
+      "type": "string",
+      "required": true,
+      "description": "Azure AD tenant ID for the org's Microsoft 365 tenant."
+    },
+    "client_id": {
+      "type": "string",
+      "required": true,
+      "description": "OAuth 2.0 application (client) ID from the org's Azure AD app registration."
+    }
+  },
+  "required_domains": [
+    "login.microsoftonline.com",
+    "graph.microsoft.com"
+  ],
+  "node_min_version": "18.0.0",
+  "bundle_entry": "dist/server.bundle.js",
+  "bundle_built_at": "2026-03-26T00:52:02.712Z",
+  "bundle_checksum": "sha256:98b49c2747602c1036e68d2cee5392c0d5d95ccca83997c219e8e92a22c75316"
+}

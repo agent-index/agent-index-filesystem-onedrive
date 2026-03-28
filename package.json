@@ -1,0 +1,25 @@
+{
+  "name": "@agent-index/filesystem-onedrive",
+  "version": "1.0.0",
+  "description": "Agent Index Filesystem MCP Server — Microsoft OneDrive/SharePoint adapter",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "agent-index-filesystem-onedrive": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "node scripts/build.js",
+    "build:bundle": "esbuild src/index.js --bundle --platform=node --target=node18 --format=esm --outfile=dist/server.bundle.js --banner:js=\"import { createRequire } from 'module'; const require = createRequire(import.meta.url);\"",
+    "test": "node --test src/**/*.test.js"
+  },
+  "keywords": ["agent-index", "mcp", "onedrive", "sharepoint", "filesystem"],
+  "author": "Agent Index",
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "@agent-index/filesystem": "file:../agent-index-filesystem"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0"
+  }
+}
