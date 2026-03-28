@@ -6872,7 +6872,7 @@ function _addCaCert(certPath) {
 
 // ../agent-index-filesystem/src/config.js
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 async function loadConfig() {
   const configPath = process.env.AIFS_CONFIG_PATH;
@@ -6907,7 +6907,15 @@ async function loadConfig() {
   if (!rf.auth) {
     throw new Error('Config missing "remote_filesystem.auth"');
   }
-  const credentialStore = (rf.auth.credential_store || "~/.agent-index/credentials/").replace(/^~/, homedir());
+  const rawCredentialStore = rf.auth.credential_store || ".agent-index/credentials/";
+  let credentialStore;
+  if (rawCredentialStore.startsWith("~")) {
+    credentialStore = rawCredentialStore.replace(/^~/, homedir());
+  } else if (rawCredentialStore.startsWith("/")) {
+    credentialStore = rawCredentialStore;
+  } else {
+    credentialStore = resolve(dirname(resolvedPath), rawCredentialStore);
+  }
   return {
     backend: rf.backend,
     connection: rf.connection,
@@ -20985,8 +20993,8 @@ var NotEmptyError = class extends AifsError {
   }
 };
 var AuthFailedError = class extends AifsError {
-  constructor(message = "Authentication failed") {
-    super("AUTH_FAILED", message);
+  constructor(message = "Authentication failed", details = {}) {
+    super("AUTH_FAILED", message, details);
   }
 };
 var BackendError = class extends AifsError {
@@ -21243,7 +21251,7 @@ async function startServer(adapter, config2) {
 
 // src/adapters/onedrive.js
 import { readFile as readFile2, writeFile, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname as dirname2, join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 var OneDriveAdapter = class {
   constructor() {
@@ -21733,7 +21741,7 @@ var OneDriveAdapter = class {
     }
   }
   async _writeCredential(tokens) {
-    const dir = dirname(this.credentialPath);
+    const dir = dirname2(this.credentialPath);
     await mkdir(dir, { recursive: true });
     await writeFile(this.credentialPath, JSON.stringify(tokens, null, 2), "utf-8");
   }
