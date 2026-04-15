@@ -35,7 +35,8 @@
     "graph.microsoft.com"
   ],
   "node_min_version": "18.0.0",
-  "bundle_entry": "dist/server.bundle.js",
+  "exec_bundle_entry": "dist/aifs-exec.bundle.js",
+  "exec_shell_wrapper": "dist/aifs-exec.sh",
   "bundle_built_at": "2026-03-28T18:03:48.168Z",
-  "bundle_checksum": "sha256:2383aea189166364d406fb3d5be6baf4199fe2501cacab2cfbeaf275cc07ad4b"
+  "exec_bundle_checksum": "sha256:2383aea189166364d406fb3d5be6baf4199fe2501cacab2cfbeaf275cc07ad4b"
 }

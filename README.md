@@ -1,12 +1,12 @@
 # agent-index-filesystem-onedrive
 
-Microsoft OneDrive and SharePoint adapter for the agent-index remote filesystem. Connects the `aifs_*` MCP tool interface to OneDrive and SharePoint document libraries via the Microsoft Graph API.
+Microsoft OneDrive and SharePoint adapter for the agent-index remote filesystem. Connects the `aifs_*` tool interface to OneDrive and SharePoint document libraries via the Microsoft Graph API.
 
 ## Overview
 
 This adapter implements the `BackendAdapter` interface from `@agent-index/filesystem` against the Microsoft Graph API. It supports personal OneDrive, organizational OneDrive for Business, and SharePoint document libraries. Path-based access is native to the Graph API, so no ID resolution is needed (unlike the Google Drive adapter).
 
-Members never interact with this package directly. The pre-built bundle is included in the bootstrap zip during org setup and runs as a background MCP server process inside Cowork.
+Members never interact with this package directly. The pre-built bundle is included in the bootstrap zip during org setup and runs as an on-demand exec process invoked by the shell wrapper.
 
 ## Features
 
@@ -36,7 +36,7 @@ npm run build:bundle     # esbuild only (no metadata stamp)
 npm test                 # Run tests
 ```
 
-The `npm run build` command produces `dist/server.bundle.js` (a self-contained single-file MCP server) and updates `adapter.json` with the build timestamp and checksum. Commit both files together.
+The `npm run build` command produces `dist/aifs-exec.bundle.js` (a self-contained single-file exec bundle) and updates `adapter.json` with the build timestamp and checksum. Commit both files together.
 
 ## Repository Structure
 
@@ -50,7 +50,8 @@ The `npm run build` command produces `dist/server.bundle.js` (a self-contained s
 │   └── adapters/
 │       └── onedrive.js     # BackendAdapter implementation
 └── dist/
-    └── server.bundle.js    # Pre-built bundle (committed to repo)
+    ├── aifs-exec.bundle.js # Pre-built exec bundle (committed to repo)
+    └── aifs-exec.sh        # Shell wrapper
 ```
 
 ## License
