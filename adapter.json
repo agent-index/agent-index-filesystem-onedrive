@@ -1,11 +1,12 @@
 {
   "name": "agent-index-filesystem-onedrive",
   "display_name": "Microsoft OneDrive / SharePoint",
-  "version": "1.0.0",
-  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries",
+  "version": "2.0.1",
+  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
   "author": "agent-index",
   "license": "proprietary",
-  "contract_version": "1.0.0",
+  "core_version": "1.0.0",
+  "contract_version": "2.0.0",
   "supported_operations": [
     "read",
     "write",
@@ -19,33 +20,32 @@
     "share",
     "unshare",
     "getPermissions",
-    "transferOwnership",
-    "search"
+    "search",
+    "transferOwnership"
   ],
-  "write_supports_if_revision": false,
-  "core_version": "1.0.0",
+  "write_supports_if_revision": true,
   "backend_id": "onedrive",
   "auth_method": "oauth2",
   "connection_schema": {
-    "drive_id": {
-      "type": "string",
-      "required": false,
-      "description": "OneDrive or SharePoint document library drive ID. Omit for user's default drive."
-    },
-    "site_id": {
-      "type": "string",
-      "required": false,
-      "description": "SharePoint site ID. Required for SharePoint document libraries, omit for personal OneDrive."
-    },
     "tenant_id": {
       "type": "string",
       "required": true,
-      "description": "Azure AD tenant ID for the org's Microsoft 365 tenant."
+      "description": "Microsoft Entra (Azure AD) directory (tenant) ID for the org's Microsoft 365 tenant. Single-tenant app."
     },
     "client_id": {
       "type": "string",
       "required": true,
-      "description": "OAuth 2.0 application (client) ID from the org's Azure AD app registration."
+      "description": "Application (client) ID of the org's Entra app registration. Public client — no secret. Requires 'Allow public client flows = Yes' on the app's Authentication settings."
+    },
+    "site_id": {
+      "type": "string",
+      "required": false,
+      "description": "SharePoint site ID hosting the org-remote document library (the org-remote root). Required for SharePoint document libraries; omit for personal OneDrive."
+    },
+    "drive_id": {
+      "type": "string",
+      "required": false,
+      "description": "OneDrive or SharePoint document-library drive ID used as the filesystem root. Omit for the site's / user's default drive."
     }
   },
   "required_domains": [
@@ -55,6 +55,6 @@
   "node_min_version": "18.0.0",
   "exec_bundle_entry": "dist/aifs-exec.bundle.js",
   "exec_shell_wrapper": "dist/aifs-exec.sh",
-  "bundle_built_at": "2026-03-28T18:03:48.168Z",
-  "exec_bundle_checksum": "sha256:2383aea189166364d406fb3d5be6baf4199fe2501cacab2cfbeaf275cc07ad4b"
+  "bundle_built_at": "2026-06-14T18:50:53.885Z",
+  "exec_bundle_checksum": "sha256:9fe14cb5576b4e4d03bedf3735fa1e52d8df1015589fb00fc48a2afa7102ea2c"
 }

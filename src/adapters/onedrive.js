@@ -1,7 +1,8 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import {
+  AifsError,
   FileNotFoundError,
   PathNotFoundError,
   AccessDeniedError,
@@ -9,41 +10,97 @@ import {
   NotEmptyError,
   AuthFailedError,
   BackendError,
+  RevisionConflictError,
+  NotImplementedError,
+  NotProvisionedError,
 } from '@agent-index/filesystem/errors';
 
+// ─── Platform-reliability helpers (parity with gdrive 2.6.0) ──────────
+
+export const AIFS_SENTINEL = 'AIFS:FILE-END';
+
 /**
- * Microsoft OneDrive/SharePoint backend adapter for the AIFS MCP server.
+ * Returns the sentinel encoding kind ('md' | 'hash' | 'slash' | 'json') if
+ * the content's last non-whitespace text is a recognized AIFS:FILE-END
+ * marker, else null. Binary ("base64:") content is never sentinel-checked.
+ */
+export function detectSentinel(content) {
+  if (typeof content !== 'string' || content.length === 0) return null;
+  if (content.startsWith('base64:')) return null;
+  const tail = content.slice(-400).replace(/\s+$/, '');
+  if (tail.endsWith(`<!-- ${AIFS_SENTINEL} -->`)) return 'md';
+  if (tail.endsWith(`// ${AIFS_SENTINEL}`)) return 'slash';
+  if (tail.endsWith(`# ${AIFS_SENTINEL}`)) return 'hash';
+  if (/"_file_end"\s*:\s*"AIFS:FILE-END"\s*[}\]\s]*$/.test(tail)) return 'json';
+  return null;
+}
+
+export const aifsSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const READ_RETRY_BACKOFF_MS = [500, 1000, 2000];
+
+/** Simple-upload ceiling. Graph requires an upload session above ~4 MB. */
+const SIMPLE_UPLOAD_MAX_BYTES = 4 * 1024 * 1024;
+/** Upload-session chunk size — must be a multiple of 320 KiB per Graph. */
+const UPLOAD_CHUNK_BYTES = 5 * 320 * 1024; // 1600 KiB
+
+const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
+const REDIRECT_URI = 'http://localhost:3939/'; // matches the registered app (single-tenant public client)
+const SCOPES = 'User.Read Files.ReadWrite.All Sites.ReadWrite.All offline_access';
+
+/** Accept either a raw OAuth code or a pasted callback URL; return the code. */
+function _extractAuthCode(input) {
+  if (input == null) return undefined;
+  if (typeof input !== 'string') return input;
+  const trimmed = input.trim();
+  if (!trimmed) return undefined;
+  if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('/')) {
+    try {
+      const u = new URL(trimmed, 'http://localhost');
+      const code = u.searchParams.get('code');
+      if (code) return code;
+    } catch { /* fall through */ }
+  }
+  if (trimmed.includes('code=') && !trimmed.includes(' ')) {
+    const match = trimmed.match(/[?&]?code=([^&\s]+)/);
+    if (match) return decodeURIComponent(match[1]);
+  }
+  return trimmed;
+}
+
+/**
+ * Microsoft OneDrive / SharePoint backend adapter for the AIFS MCP server.
  *
- * Uses the Microsoft Graph API to access OneDrive and SharePoint document libraries.
- * Unlike Google Drive, the Graph API supports path-based access natively via
- * /drive/root:/path/to/file, which simplifies the adapter considerably.
+ * Uses the Microsoft Graph driveItem API. Unlike Google Drive (ID-only), Graph
+ * supports path-addressing natively — `/drives/{id}/root:/path:` and
+ * `/drives/{id}/items/{id}:/rel:` — so this adapter resolves logical AIFS paths
+ * directly to Graph addresses without a path->ID walk.
  *
- * Connection config expected in agent-index.json:
- * {
- *   "tenant_id": "...",             // Azure AD tenant ID (or "common" for multi-tenant)
- *   "client_id": "...",             // Azure AD app registration client ID
- *   "drive_id": "...",              // OneDrive/SharePoint drive ID (optional — defaults to user's drive)
- *   "site_id": "...",               // SharePoint site ID (optional — for SharePoint document libraries)
- *   "root_path": "/"               // Root path within the drive (optional — defaults to root)
- * }
+ * Addressing convention (core-ops phase):
+ *   - Absolute paths (`/shared/...`)  -> the org-remote SharePoint document
+ *     library (the configured site_id/drive_id), or the user's default drive.
+ *   - `id:{itemId}/rel` ID anchors    -> the member's OWN OneDrive (`/me/drive`),
+ *     for member-space addressing where the caller is granted but cannot
+ *     enumerate from a root (standards section "Addressing"). Cross-drive
+ *     shared-with-me anchors are an ACL fast-follow concern.
+ *
+ * Connection config (agent-index.json -> remote_filesystem.connection):
+ *   { "tenant_id", "client_id", "site_id"?, "drive_id"? }   — NO client_secret.
+ *
+ * Auth: single-tenant public client, OAuth auth-code + PKCE, loopback
+ * redirect, no secret. Requires "Allow public client flows = Yes" on the app.
  */
 export class OneDriveAdapter {
   constructor() {
     this.connection = null;
     this.credentialPath = null;
+    this.pkcePath = null;
     this.tokens = null;
-
-    // PKCE state for auth flow
     this._codeVerifier = null;
-
-    // Path cache: maps logical path -> { id, type, etag }
-    // Used for operations that need item IDs (copy, delete)
+    this._ownDriveOk = false; // cached: member's own OneDrive confirmed provisioned
+    // path cache: normalized logical path -> { id, type, etag, ctag }
     this.pathCache = new Map();
   }
 
-  /**
-   * Initialize the adapter with connection config and credential store path.
-   */
   async initialize(connection, credentialStore) {
     this.connection = connection;
 
@@ -53,36 +110,39 @@ export class OneDriveAdapter {
     if (!connection.tenant_id) {
       throw new BackendError('OneDrive connection config missing "tenant_id"');
     }
+    // Public client by design — a secret means the app was mis-registered as a
+    // confidential client. Fail loud (tech-design D1 / dev-environment finding).
+    if (connection.client_secret) {
+      throw new BackendError(
+        'OneDrive connection carries a "client_secret", but this adapter is a public client ' +
+        '(PKCE, no secret). Remove client_secret and register the app with "Allow public client flows = Yes".'
+      );
+    }
 
     this.credentialPath = join(credentialStore, 'onedrive.json');
-
-    // Try to load stored credentials
+    // PKCE verifier persists here between the (separate-process) start/complete
+    // auth invocations — see startAuth/completeAuth.
+    this.pkcePath = join(credentialStore, 'onedrive-pkce.json');
     try {
       this.tokens = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
     } catch {
-      // No stored credentials — that's fine, member will authenticate
       this.tokens = null;
     }
   }
 
-  // ─── Auth ────────────────────────────────────────────────────────────
+  // ─── Auth ──────────────────────────────────────────────────────────
 
   async getAuthStatus() {
     const base = { backend: 'onedrive' };
-
     if (!this.tokens || !this.tokens.access_token) {
       return { authenticated: false, ...base, reason: 'no_credential' };
     }
-
-    // Check if token is expired
     if (this.tokens.expires_at && this.tokens.expires_at < Date.now()) {
       if (this.tokens.refresh_token) {
-        // Try refreshing
         try {
           await this._refreshToken();
           return {
-            authenticated: true,
-            ...base,
+            authenticated: true, ...base,
             user_identity: await this._getUserEmail(),
             expires_at: new Date(this.tokens.expires_at).toISOString(),
           };
@@ -92,503 +152,77 @@ export class OneDriveAdapter {
       }
       return { authenticated: false, ...base, reason: 'expired' };
     }
-
     return {
-      authenticated: true,
-      ...base,
+      authenticated: true, ...base,
       user_identity: await this._getUserEmail(),
       expires_at: this.tokens.expires_at
-        ? new Date(this.tokens.expires_at).toISOString()
-        : undefined,
+        ? new Date(this.tokens.expires_at).toISOString() : undefined,
     };
   }
 
-  async startAuth() {
-    // Generate PKCE code verifier and challenge
+  _authUrl() {
     this._codeVerifier = randomBytes(32).toString('base64url');
-    const codeChallenge = createHash('sha256')
-      .update(this._codeVerifier)
-      .digest('base64url');
-
+    const codeChallenge = createHash('sha256').update(this._codeVerifier).digest('base64url');
     const params = new URLSearchParams({
       client_id: this.connection.client_id,
       response_type: 'code',
-      redirect_uri: 'http://localhost:3939/callback',
-      scope: 'Files.ReadWrite.All offline_access User.Read',
+      redirect_uri: REDIRECT_URI,
+      scope: SCOPES,
       code_challenge: codeChallenge,
       code_challenge_method: 'S256',
-      prompt: 'consent',
+      prompt: 'select_account',
     });
+    const tenant = this.connection.tenant_id; // single-tenant
+    return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?${params.toString()}`;
+  }
 
-    const tenantId = this.connection.tenant_id || 'common';
-    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?${params.toString()}`;
-
+  async startAuth() {
+    const authUrl = this._authUrl();
+    // In the on-demand exec model, `start` and `complete` run in SEPARATE
+    // processes, so the PKCE verifier must survive on disk between them.
+    try {
+      await mkdir(dirname(this.pkcePath), { recursive: true });
+      await writeFile(this.pkcePath, JSON.stringify({ code_verifier: this._codeVerifier, created: Date.now() }), 'utf-8');
+    } catch (err) {
+      console.error(`[aifs] Warning: could not persist PKCE verifier: ${err.message}`);
+    }
     return {
       status: 'awaiting_code',
       auth_url: authUrl,
       message:
-        'Open this URL in your browser, sign in with your Microsoft account, ' +
-        'grant access to OneDrive/SharePoint, and paste the authorization code here. ' +
-        'The code appears in the URL bar after redirect (the "code" parameter).',
+        'Open this URL in your browser and sign in with your Microsoft 365 account. After granting ' +
+        'access, the page will try to redirect to http://localhost:3939/ and fail to load — that is ' +
+        'EXPECTED. Copy the FULL URL from your browser address bar (it contains "?code=...") and pass it ' +
+        'back as auth_code to the "complete" step. If sign-in fails with a public-client error, enable ' +
+        '"Allow public client flows = Yes" (Entra -> App registrations -> your app -> Authentication -> Advanced settings).',
     };
   }
 
   async completeAuth(authCode) {
-    if (!authCode) {
-      throw new AuthFailedError('No authorization code provided');
+    authCode = _extractAuthCode(authCode);
+    if (!authCode) throw new AuthFailedError('No authorization code provided');
+
+    // Recover the PKCE verifier persisted by startAuth (separate process).
+    let verifier = this._codeVerifier;
+    if (!verifier) {
+      try { verifier = JSON.parse(await readFile(this.pkcePath, 'utf-8')).code_verifier; } catch { /* */ }
+    }
+    if (!verifier) {
+      throw new AuthFailedError(
+        'Missing PKCE verifier. Run the authenticate "start" step again, then "complete" with the ' +
+        'same credential store (do not delete .agent-index/credentials between the two steps).'
+      );
     }
 
-    const tenantId = this.connection.tenant_id || 'common';
-    const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
-
+    const tenant = this.connection.tenant_id;
+    const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
     const body = new URLSearchParams({
       client_id: this.connection.client_id,
       grant_type: 'authorization_code',
       code: authCode,
-      redirect_uri: 'http://localhost:3939/callback',
-      code_verifier: this._codeVerifier || '',
-      scope: 'Files.ReadWrite.All offline_access User.Read',
-    });
-
-    try {
-      const res = await fetch(tokenUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString(),
-      });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new AuthFailedError(
-          `Token exchange failed: ${err.error_description || err.error || res.statusText}`
-        );
-      }
-
-      const data = await res.json();
-      this.tokens = {
-        access_token: data.access_token,
-        refresh_token: data.refresh_token,
-        expires_at: Date.now() + (data.expires_in * 1000),
-      };
-
-      await this._writeCredential(this.tokens);
-
-      const email = await this._getUserEmail();
-      return {
-        status: 'authenticated',
-        user_identity: email,
-        message: `Successfully authenticated to OneDrive as ${email}.`,
-      };
-    } catch (err) {
-      if (err instanceof AuthFailedError) throw err;
-      throw new AuthFailedError(`OAuth token exchange failed: ${err.message}`);
-    }
-  }
-
-  // ─── File Operations ─────────────────────────────────────────────────
-
-  async read(path) {
-    await this._ensureAuth();
-    const graphPath = this._toGraphPath(path);
-
-    try {
-      // Get file content
-      const res = await this._graphRequest(`${graphPath}:/content`, {
-        rawResponse: true,
-      });
-
-      const buffer = Buffer.from(await res.arrayBuffer());
-
-      // Try UTF-8; fall back to base64 for binary
-      const text = buffer.toString('utf-8');
-      if (text.includes('\0')) {
-        return 'base64:' + buffer.toString('base64');
-      }
-      return text;
-    } catch (err) {
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async write(path, content) {
-    await this._ensureAuth();
-    const graphPath = this._toGraphPath(path);
-
-    // Determine body
-    let body;
-    let contentType = 'text/plain';
-    if (content.startsWith('base64:')) {
-      body = Buffer.from(content.slice(7), 'base64');
-      contentType = 'application/octet-stream';
-    } else {
-      body = content;
-    }
-
-    try {
-      // PUT to :/content creates or overwrites the file
-      // Graph API auto-creates parent folders for PUT on path-based endpoints
-      const res = await this._graphRequest(`${graphPath}:/content`, {
-        method: 'PUT',
-        headers: { 'Content-Type': contentType },
-        body,
-      });
-
-      const data = await res.json();
-
-      // Cache the item
-      this.pathCache.set(this._normalizePath(path), {
-        id: data.id,
-        type: 'file',
-        etag: data.eTag,
-      });
-    } catch (err) {
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async list(path, recursive = false) {
-    await this._ensureAuth();
-    const graphPath = this._toGraphPath(path);
-
-    try {
-      // List children
-      const endpoint = path === '/' || path === ''
-        ? `${this._driveBase()}/root/children`
-        : `${graphPath}:/children`;
-
-      const entries = [];
-      let url = endpoint;
-
-      do {
-        const res = await this._graphRequest(url);
-        const data = await res.json();
-
-        for (const item of data.value || []) {
-          const isDir = !!item.folder;
-          const entry = {
-            name: item.name,
-            type: isDir ? 'directory' : 'file',
-          };
-
-          if (!isDir) {
-            entry.size = item.size || 0;
-            entry.modified = item.lastModifiedDateTime;
-          }
-
-          // Cache while listing
-          const entryPath = path === '/' ? `/${item.name}` : `${this._normalizePath(path)}/${item.name}`;
-          this.pathCache.set(entryPath, {
-            id: item.id,
-            type: isDir ? 'directory' : 'file',
-            etag: item.eTag,
-          });
-
-          entries.push(entry);
-
-          // Recurse into subdirectories if requested
-          if (recursive && isDir) {
-            const subEntries = await this.list(entryPath, true);
-            for (const sub of subEntries) {
-              entries.push({
-                ...sub,
-                name: `${item.name}/${sub.name}`,
-              });
-            }
-          }
-        }
-
-        // Handle pagination
-        url = data['@odata.nextLink'] || null;
-      } while (url);
-
-      return entries;
-    } catch (err) {
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async exists(path) {
-    await this._ensureAuth();
-    const graphPath = this._toGraphPath(path);
-
-    try {
-      const res = await this._graphRequest(graphPath, { allowNotFound: true });
-
-      if (res.status === 404) {
-        return { exists: false };
-      }
-
-      const data = await res.json();
-      const isDir = !!data.folder;
-
-      // Cache
-      this.pathCache.set(this._normalizePath(path), {
-        id: data.id,
-        type: isDir ? 'directory' : 'file',
-        etag: data.eTag,
-      });
-
-      return { exists: true, type: isDir ? 'directory' : 'file' };
-    } catch (err) {
-      // 404 is expected for non-existent paths
-      if (err.status === 404) {
-        return { exists: false };
-      }
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async stat(path) {
-    await this._ensureAuth();
-    const graphPath = this._toGraphPath(path);
-
-    try {
-      const res = await this._graphRequest(graphPath);
-      const data = await res.json();
-
-      return {
-        size: data.size || 0,
-        modified: data.lastModifiedDateTime,
-        created: data.createdDateTime,
-        etag: data.eTag,
-      };
-    } catch (err) {
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async delete(path) {
-    await this._ensureAuth();
-
-    // We need the item ID for delete
-    const itemId = await this._resolveItemId(path);
-    if (!itemId) {
-      throw new FileNotFoundError(path);
-    }
-
-    // Check if it's a non-empty directory
-    const cached = this.pathCache.get(this._normalizePath(path));
-    if (cached && cached.type === 'directory') {
-      const children = await this.list(path, false);
-      if (children.length > 0) {
-        throw new NotEmptyError(path);
-      }
-    }
-
-    try {
-      await this._graphRequest(`${this._driveBase()}/items/${itemId}`, {
-        method: 'DELETE',
-      });
-      this.pathCache.delete(this._normalizePath(path));
-    } catch (err) {
-      this._handleGraphError(err, path);
-    }
-  }
-
-  async copy(source, destination) {
-    await this._ensureAuth();
-
-    // Need source item ID
-    const sourceId = await this._resolveItemId(source);
-    if (!sourceId) {
-      throw new FileNotFoundError(source);
-    }
-
-    // Ensure destination parent exists and get its ID
-    const destParentPath = this._parentPath(destination);
-    const destFileName = this._fileName(destination);
-
-    // Resolve parent — create it if needed by writing a temp file then deleting
-    let parentId;
-    const parentCached = this.pathCache.get(this._normalizePath(destParentPath));
-    if (parentCached) {
-      parentId = parentCached.id;
-    } else {
-      // Resolve by querying the parent path
-      const parentGraphPath = this._toGraphPath(destParentPath);
-      try {
-        const res = await this._graphRequest(parentGraphPath);
-        const data = await res.json();
-        parentId = data.id;
-        this.pathCache.set(this._normalizePath(destParentPath), {
-          id: data.id,
-          type: 'directory',
-          etag: data.eTag,
-        });
-      } catch (err) {
-        // Parent doesn't exist — create it by writing and reading
-        throw new PathNotFoundError(destParentPath);
-      }
-    }
-
-    try {
-      // Graph API copy is async — it returns a monitor URL
-      const res = await this._graphRequest(`${this._driveBase()}/items/${sourceId}/copy`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parentReference: { driveId: this._getDriveId(), id: parentId },
-          name: destFileName,
-        }),
-      });
-
-      // Copy is accepted (202) — we don't wait for completion since it's typically fast
-      // for small files. For large files, the monitor URL could be polled.
-    } catch (err) {
-      this._handleGraphError(err, source);
-    }
-  }
-
-  // ─── Graph API Helpers ──────────────────────────────────────────────
-
-  /**
-   * Make an authenticated request to the Microsoft Graph API.
-   */
-  async _graphRequest(urlOrPath, options = {}) {
-    await this._ensureAuth();
-
-    const { method = 'GET', headers = {}, body, rawResponse = false, allowNotFound = false } = options;
-
-    // Build full URL
-    let url;
-    if (urlOrPath.startsWith('https://')) {
-      url = urlOrPath; // Already a full URL (e.g., pagination nextLink)
-    } else {
-      url = `https://graph.microsoft.com/v1.0${urlOrPath}`;
-    }
-
-    const fetchHeaders = {
-      Authorization: `Bearer ${this.tokens.access_token}`,
-      ...headers,
-    };
-
-    const res = await fetch(url, {
-      method,
-      headers: fetchHeaders,
-      body: body !== undefined ? body : undefined,
-    });
-
-    if (allowNotFound && res.status === 404) {
-      return res;
-    }
-
-    if (!res.ok) {
-      const err = new Error(`Graph API error: ${res.status} ${res.statusText}`);
-      err.status = res.status;
-      try {
-        err.body = await res.json();
-        err.message = err.body?.error?.message || err.message;
-      } catch {
-        // Ignore JSON parse failure on error response
-      }
-      throw err;
-    }
-
-    if (rawResponse) {
-      return res;
-    }
-
-    return res;
-  }
-
-  /**
-   * Build the Graph API drive base path.
-   */
-  _driveBase() {
-    if (this.connection.site_id && this.connection.drive_id) {
-      return `/sites/${this.connection.site_id}/drives/${this.connection.drive_id}`;
-    }
-    if (this.connection.drive_id) {
-      return `/drives/${this.connection.drive_id}`;
-    }
-    // Default to the authenticated user's OneDrive
-    return '/me/drive';
-  }
-
-  /**
-   * Get the drive ID for copy operations.
-   */
-  _getDriveId() {
-    return this.connection.drive_id || null;
-  }
-
-  /**
-   * Convert a logical AIFS path to a Graph API path.
-   * Graph API uses /drive/root:/path/to/file for path-based access.
-   */
-  _toGraphPath(path) {
-    const normalized = this._normalizePath(path);
-    if (normalized === '/') {
-      return `${this._driveBase()}/root`;
-    }
-    // Graph API path-based: /drive/root:/path/to/item
-    return `${this._driveBase()}/root:${normalized}`;
-  }
-
-  /**
-   * Resolve a logical path to a OneDrive item ID.
-   * Checks cache first, then queries Graph API.
-   */
-  async _resolveItemId(path) {
-    const normalized = this._normalizePath(path);
-    const cached = this.pathCache.get(normalized);
-    if (cached) {
-      return cached.id;
-    }
-
-    // Query Graph API for the item
-    const graphPath = this._toGraphPath(path);
-    try {
-      const res = await this._graphRequest(graphPath, { allowNotFound: true });
-      if (res.status === 404) {
-        return null;
-      }
-      const data = await res.json();
-      const isDir = !!data.folder;
-      this.pathCache.set(normalized, {
-        id: data.id,
-        type: isDir ? 'directory' : 'file',
-        etag: data.eTag,
-      });
-      return data.id;
-    } catch (err) {
-      if (err.status === 404) return null;
-      this._handleGraphError(err, path);
-    }
-  }
-
-  // ─── Token Management ───────────────────────────────────────────────
-
-  /**
-   * Ensure we have a valid access token, refreshing if needed.
-   */
-  async _ensureAuth() {
-    if (!this.tokens || !this.tokens.access_token) {
-      throw new NotAuthenticatedError('no_credential');
-    }
-
-    // Refresh if expired or about to expire (5 minute buffer)
-    if (this.tokens.expires_at && (this.tokens.expires_at - 300000) < Date.now()) {
-      if (this.tokens.refresh_token) {
-        await this._refreshToken();
-      } else {
-        throw new NotAuthenticatedError('expired');
-      }
-    }
-  }
-
-  /**
-   * Refresh the access token using the stored refresh token.
-   */
-  async _refreshToken() {
-    const tenantId = this.connection.tenant_id || 'common';
-    const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
-
-    const body = new URLSearchParams({
-      client_id: this.connection.client_id,
-      grant_type: 'refresh_token',
-      refresh_token: this.tokens.refresh_token,
-      scope: 'Files.ReadWrite.All offline_access User.Read',
+      redirect_uri: REDIRECT_URI,
+      code_verifier: verifier,
+      scope: SCOPES,
     });
 
     const res = await fetch(tokenUrl, {
@@ -596,27 +230,610 @@ export class OneDriveAdapter {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const desc = err.error_description || err.error || res.statusText;
+      if (/AADSTS7000218|public client|client_assertion|client_secret/i.test(desc)) {
+        throw new AuthFailedError(
+          'Token exchange failed: the app rejected the public-client (no-secret) flow. ' +
+          'Enable "Allow public client flows = Yes" on the app registration (Entra -> App registrations -> ' +
+          'your app -> Authentication -> Advanced settings).',
+          { retryable: false }
+        );
+      }
+      if (/expired|invalid_grant/i.test(desc)) {
+        throw new AuthFailedError(
+          'The authorization code expired or was already used (codes are single-use). Run authentication again.',
+          { retryable: true }
+        );
+      }
+      throw new AuthFailedError(`Token exchange failed: ${desc}`);
+    }
 
+    const data = await res.json();
+    this.tokens = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: Date.now() + data.expires_in * 1000,
+    };
+    await this._writeCredential(this.tokens);
+    try { await rm(this.pkcePath, { force: true }); } catch { /* best-effort cleanup */ }
+    const email = await this._getUserEmail();
+    return {
+      status: 'authenticated',
+      user_identity: email,
+      message: `Successfully authenticated to Microsoft 365 as ${email}.`,
+    };
+  }
+
+  // ─── File operations ─────────────────────────────────────────────────
+
+  async read(path) {
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const addr = this._addr(path);
+
+    const fetchBuffer = async () => {
+      const res = await this._graph(addr.content, { rawResponse: true });
+      return Buffer.from(await res.arrayBuffer());
+    };
+
+    try {
+      let buffer = await fetchBuffer();
+
+      // flakyread parity: never return empty for a file metadata says is non-empty.
+      if (buffer.length === 0) {
+        let declaredSize = 0;
+        try {
+          const metaRes = await this._graph(`${addr.meta}?$select=size`);
+          declaredSize = Number((await metaRes.json())?.size ?? 0);
+        } catch { /* treat as genuinely empty */ }
+        if (declaredSize > 0) {
+          for (const delay of READ_RETRY_BACKOFF_MS) {
+            await aifsSleep(delay);
+            buffer = await fetchBuffer();
+            if (buffer.length > 0) break;
+          }
+          if (buffer.length === 0) {
+            throw new AifsError(
+              'AIFS_READ_UNRELIABLE',
+              `read: backend returned empty content for "${path}" but metadata reports ${declaredSize} bytes ` +
+              `(retried ${READ_RETRY_BACKOFF_MS.length}x). Transient backend failure — retry; do NOT treat as empty.`,
+              { path, declared_size: declaredSize, retries: READ_RETRY_BACKOFF_MS.length }
+            );
+          }
+        }
+      }
+
+      const text = buffer.toString('utf-8');
+      if (text.includes('\0')) return 'base64:' + buffer.toString('base64');
+      return text;
+    } catch (err) {
+      if (err instanceof AifsError) throw err;
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async write(path, content, options = {}) {
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const addr = this._addr(path);
+
+    // Ensure parent directories exist — Graph does NOT auto-create them on a
+    // path-addressed PUT (it 404s). This is the single most common silent
+    // failure if omitted.
+    await this._ensureDir(this._parentPath(path));
+
+    // Revision-aware write (O1 = cTag): compare current cTag to ifRevision,
+    // then PUT with If-Match: eTag as a backend backstop.
+    let etagForIfMatch = null;
+    if (options.ifRevision) {
+      try {
+        const metaRes = await this._graph(`${addr.meta}?$select=cTag,eTag`, { allowNotFound: true });
+        if (metaRes.status !== 404) {
+          const meta = await metaRes.json();
+          const currentRevision = meta.cTag || null;
+          if (currentRevision !== options.ifRevision) {
+            throw new RevisionConflictError(path, options.ifRevision, currentRevision);
+          }
+          etagForIfMatch = meta.eTag || null;
+        }
+      } catch (err) {
+        if (err instanceof RevisionConflictError) throw err;
+        if (err.status !== 404) this._handleGraphError(err, path);
+      }
+    }
+
+    const isBinary = content.startsWith('base64:');
+    const payload = isBinary ? Buffer.from(content.slice(7), 'base64') : Buffer.from(content, 'utf-8');
+    const contentType = isBinary ? 'application/octet-stream' : 'text/plain';
+    const sentinelKind = detectSentinel(content);
+
+    const doWrite = async () => {
+      if (payload.length > SIMPLE_UPLOAD_MAX_BYTES) {
+        return this._uploadLarge(addr, payload, etagForIfMatch);
+      }
+      const headers = { 'Content-Type': contentType };
+      if (etagForIfMatch) headers['if-match'] = etagForIfMatch;
+      const res = await this._graph(addr.content, { method: 'PUT', headers, body: payload });
+      return res.json();
+    };
+
+    try {
+      let item = await doWrite();
+
+      if (sentinelKind) {
+        const verifyOnce = async () => {
+          const vRes = await this._graph(addr.content, { rawResponse: true });
+          const back = Buffer.from(await vRes.arrayBuffer()).toString('utf-8');
+          return detectSentinel(back) === sentinelKind;
+        };
+        if (!(await verifyOnce())) {
+          item = await doWrite();
+          if (!(await verifyOnce())) {
+            throw new AifsError(
+              'AIFS_WRITE_VERIFY_FAILED',
+              `write: AIFS:FILE-END sentinel did not survive the upload of "${path}" (retried once). ` +
+              `The remote copy is likely tail-truncated — do not trust it; re-write from the canonical source.`,
+              { path, sentinel_kind: sentinelKind }
+            );
+          }
+        }
+      }
+
+      if (item?.id) {
+        this.pathCache.set(this._normalizePath(path), {
+          id: item.id, type: 'file', etag: item.eTag, ctag: item.cTag,
+        });
+      }
+      return { revision: item?.cTag || null };
+    } catch (err) {
+      if (err instanceof AifsError) throw err;
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async list(path, recursive = false) {
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const addr = this._addr(path);
+    try {
+      const entries = [];
+      let url = addr.child;
+      do {
+        const res = await this._graph(url);
+        const data = await res.json();
+        for (const item of data.value || []) {
+          const isDir = !!item.folder;
+          const entry = { name: item.name, type: isDir ? 'directory' : 'file' };
+          if (!isDir) { entry.size = item.size || 0; entry.modified = item.lastModifiedDateTime; }
+          const np = this._normalizePath(path);
+          const entryPath = np === '/' ? `/${item.name}` : `${np}/${item.name}`;
+          this.pathCache.set(entryPath, { id: item.id, type: entry.type, etag: item.eTag, ctag: item.cTag });
+          entries.push(entry);
+          if (recursive && isDir) {
+            const sub = await this.list(entryPath, true);
+            for (const s of sub) entries.push({ ...s, name: `${item.name}/${s.name}` });
+          }
+        }
+        url = data['@odata.nextLink'] || null;
+      } while (url);
+      return entries;
+    } catch (err) {
+      if (err.status === 404) throw new PathNotFoundError(path);
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async exists(path) {
+    if (typeof path !== 'string' || !path) {
+      throw new AifsError('INVALID_ARGS', 'exists: "path" must be a non-empty string', { path });
+    }
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const addr = this._addr(path);
+    try {
+      const res = await this._graph(`${addr.meta}?$select=id,folder,eTag,cTag`, { allowNotFound: true });
+      if (res.status === 404) {
+        this.pathCache.delete(this._normalizePath(path));
+        return { exists: false };
+      }
+      const data = await res.json();
+      const isDir = !!data.folder;
+      this.pathCache.set(this._normalizePath(path), {
+        id: data.id, type: isDir ? 'directory' : 'file', etag: data.eTag, ctag: data.cTag,
+      });
+      return { exists: true, type: isDir ? 'directory' : 'file' };
+    } catch (err) {
+      if (err.status === 404) return { exists: false };
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async stat(path) {
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const addr = this._addr(path);
+    try {
+      const res = await this._graph(
+        `${addr.meta}?$select=id,size,lastModifiedDateTime,createdDateTime,cTag,eTag,folder,file`
+      );
+      const data = await res.json();
+      return {
+        id: data.id,
+        size: data.size || 0,
+        modified: data.lastModifiedDateTime,
+        created: data.createdDateTime,
+        revision: data.cTag || null,
+        is_dir: !!data.folder,
+      };
+    } catch (err) {
+      if (err.status === 404) throw new FileNotFoundError(path);
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async delete(path) {
+    if (typeof path !== 'string' || !path) {
+      throw new AifsError('INVALID_ARGS', 'delete: "path" must be a non-empty string', { path });
+    }
+    await this._ensureAuth();
+    await this._guardOwnDrive(path);
+    const itemId = await this._resolveItemId(path);
+    if (!itemId) throw new FileNotFoundError(path);
+
+    // Non-recursive contract (O2): refuse a non-empty directory even though
+    // Graph DELETE is server-side recursive — keeps behavior identical across
+    // backends. Hard-delete workflows must remove contents first.
+    const cached = this.pathCache.get(this._normalizePath(path));
+    if (cached && cached.type === 'directory') {
+      const children = await this.list(path, false);
+      if (children.length > 0) throw new NotEmptyError(path);
+    }
+
+    try {
+      await this._graph(`${this._driveBaseFor(path)}/items/${itemId}`, { method: 'DELETE' });
+      this.pathCache.delete(this._normalizePath(path));
+    } catch (err) {
+      if (err.status === 404) throw new FileNotFoundError(path);
+      this._handleGraphError(err, path);
+    }
+  }
+
+  async copy(source, destination) {
+    if (typeof source !== 'string' || !source) {
+      throw new AifsError('INVALID_ARGS', 'copy: "source" must be a non-empty string', { source });
+    }
+    if (typeof destination !== 'string' || !destination) {
+      throw new AifsError('INVALID_ARGS', 'copy: "destination" must be a non-empty string', { destination });
+    }
+    await this._ensureAuth();
+    await this._guardOwnDrive(source);
+
+    const sourceId = await this._resolveItemId(source);
+    if (!sourceId) throw new FileNotFoundError(source);
+
+    const destParent = this._parentPath(destination);
+    const destName = this._fileName(destination);
+    await this._ensureDir(destParent);
+    const parentMeta = await this._statRaw(destParent);
+    if (!parentMeta) throw new PathNotFoundError(destParent);
+
+    try {
+      // Graph copy is async: 202 + Location monitor URL. Poll to completion so
+      // the synchronous AIFS contract holds.
+      const res = await this._graph(`${this._driveBaseFor(source)}/items/${sourceId}/copy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parentReference: { driveId: parentMeta.parentReference?.driveId, id: parentMeta.id },
+          name: destName,
+        }),
+        rawResponse: true,
+      });
+      const monitor = res.headers.get('location');
+      if (res.status === 202 && monitor) {
+        await this._pollCopy(monitor, destination);
+      }
+    } catch (err) {
+      this._handleGraphError(err, source);
+    }
+  }
+
+  async _pollCopy(monitorUrl, destination) {
+    const deadline = Date.now() + 60_000;
+    let delay = 500;
+    for (;;) {
+      const res = await fetch(monitorUrl); // monitor URL is pre-authenticated
+      const data = await res.json().catch(() => ({}));
+      const status = data.status;
+      if (status === 'completed' || res.status === 200 || res.status === 303) {
+        this.pathCache.delete(this._normalizePath(destination));
+        return;
+      }
+      if (status === 'failed') {
+        throw new BackendError(`copy failed: ${data.error?.message || 'backend reported failure'}`);
+      }
+      if (Date.now() > deadline) {
+        throw new BackendError(`copy did not complete within 60s (monitor: ${monitorUrl})`);
+      }
+      await aifsSleep(delay);
+      delay = Math.min(delay * 1.5, 4000);
+    }
+  }
+
+  // ─── ACL ops — ACL fast-follow (not in the core-ops phase) ───────────
+
+  async share() { throw new NotImplementedError('share', 'onedrive'); }
+  async unshare() { throw new NotImplementedError('unshare', 'onedrive'); }
+  async getPermissions() { throw new NotImplementedError('getPermissions', 'onedrive'); }
+  async search() { throw new NotImplementedError('search', 'onedrive'); }
+  async transferOwnership() { throw new NotImplementedError('transferOwnership', 'onedrive'); }
+
+  // ─── Large upload (session) ──────────────────────────────────────────
+
+  async _uploadLarge(addr, payload, etagForIfMatch) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (etagForIfMatch) headers['if-match'] = etagForIfMatch;
+    const sessionRes = await this._graph(`${addr.content.replace(/\/content$/, '')}/createUploadSession`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'replace' } }),
+    });
+    const { uploadUrl } = await sessionRes.json();
+    const total = payload.length;
+    let start = 0;
+    let lastItem = null;
+    while (start < total) {
+      const end = Math.min(start + UPLOAD_CHUNK_BYTES, total);
+      const chunk = payload.subarray(start, end);
+      const res = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Length': String(chunk.length),
+          'Content-Range': `bytes ${start}-${end - 1}/${total}`,
+        },
+        body: chunk,
+      });
+      if (!res.ok && res.status !== 202) {
+        const e = new Error(`upload session chunk failed: ${res.status} ${res.statusText}`);
+        e.status = res.status;
+        throw e;
+      }
+      if (res.status === 200 || res.status === 201) lastItem = await res.json().catch(() => null);
+      start = end;
+    }
+    return lastItem || {};
+  }
+
+  // ─── Provisioning guard ──────────────────────────────────────────────
+
+  /** True when the path targets the member's OWN OneDrive (id-anchor, or a
+   *  config with no site/drive so the default drive is /me/drive). */
+  _isOwnDrive(path) {
+    return this._isAnchor(path) || (!this.connection.site_id && !this.connection.drive_id);
+  }
+
+  /** Guard own-drive access: a member's OneDrive provisions lazily (first
+   *  office.com sign-in). Surface a clear NOT_PROVISIONED instead of a
+   *  misleading FILE_NOT_FOUND. Cached per process; configured SharePoint
+   *  org-root paths skip it entirely. */
+  async _guardOwnDrive(path) {
+    if (!this._isOwnDrive(path) || this._ownDriveOk) return;
+    const r = await this._graph('/me/drive?$select=id', { allowNotFound: true });
+    if (r.status === 404) {
+      throw new NotProvisionedError(
+        "Your OneDrive isn't set up yet. Sign in once at https://office.com (open OneDrive), then re-run setup."
+      );
+    }
+    this._ownDriveOk = true;
+  }
+
+  /** Resolve a SharePoint site URL to { site_id, drive_id } (adapter-internal
+   *  helper used by create-org; not a contract op). */
+  async resolveSite(siteUrl) {
+    await this._ensureAuth();
+    let u;
+    try { u = new URL(siteUrl); } catch { throw new AifsError('INVALID_ARGS', `resolveSite: invalid site URL "${siteUrl}"`, { siteUrl }); }
+    const rel = u.pathname.replace(/\/+$/, '');
+    if (!rel || rel === '/') {
+      throw new AifsError('INVALID_ARGS', 'resolveSite: site URL must include a /sites/<name> path', { siteUrl });
+    }
+    try {
+      // Colon form, NO $select (Graph 400s with it on the colon-addressed path).
+      const site = await (await this._graph(`/sites/${u.hostname}:${rel}`)).json();
+      const drive = await (await this._graph(`/sites/${site.id}/drive?$select=id,name`)).json();
+      return { site_id: site.id, drive_id: drive.id, site_web_url: site.webUrl, drive_name: drive.name };
+    } catch (err) {
+      if (err instanceof AifsError) throw err;
+      this._handleGraphError(err, siteUrl);
+    }
+  }
+
+  // ─── Graph plumbing ──────────────────────────────────────────────────
+
+  async _graph(urlOrPath, options = {}) {
+    const { method = 'GET', headers = {}, body, allowNotFound = false } = options;
+    const url = urlOrPath.startsWith('https://') ? urlOrPath : `${GRAPH_ROOT}${urlOrPath}`;
+    const doFetch = () => fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${this.tokens.access_token}`, ...headers },
+      body: body !== undefined ? body : undefined,
+    });
+    let res = await doFetch();
+    if (allowNotFound && res.status === 404) return res;
+    if (!res.ok) {
+      // Honor Retry-After on throttling with one bounded retry.
+      if (res.status === 429 || res.status === 503) {
+        const wait = Number(res.headers.get('retry-after') || 2) * 1000;
+        await aifsSleep(Math.min(wait, 10_000));
+        res = await doFetch();
+        if (allowNotFound && res.status === 404) return res;
+        if (res.ok) return res;
+      }
+      const err = new Error(`Graph API error: ${res.status} ${res.statusText}`);
+      err.status = res.status;
+      try { err.body = await res.json(); err.message = err.body?.error?.message || err.message; } catch { /* */ }
+      throw err;
+    }
+    return res;
+  }
+
+  /** Drive base for absolute paths: SharePoint library or user default drive. */
+  _driveBase() {
+    if (this.connection.site_id && this.connection.drive_id) {
+      return `/sites/${this.connection.site_id}/drives/${this.connection.drive_id}`;
+    }
+    if (this.connection.drive_id) return `/drives/${this.connection.drive_id}`;
+    return '/me/drive';
+  }
+
+  /** Drive base for a given logical path: id-anchors live in the member's own OneDrive. */
+  _driveBaseFor(path) {
+    return this._isAnchor(path) ? '/me/drive' : this._driveBase();
+  }
+
+  _isAnchor(path) {
+    return typeof path === 'string' && path.startsWith('id:');
+  }
+
+  /**
+   * Build the Graph addresses for a logical path:
+   *   { meta, child, content }  — metadata GET, /children, /content endpoints.
+   */
+  _addr(path) {
+    if (this._isAnchor(path)) {
+      const m = /^id:([^/]+)(?:\/(.*))?$/.exec(path);
+      const id = m[1];
+      const rel = m[2] ? this._normalizePath('/' + m[2]).slice(1) : '';
+      const base = '/me/drive';
+      if (!rel) {
+        return { meta: `${base}/items/${id}`, child: `${base}/items/${id}/children`, content: `${base}/items/${id}/content` };
+      }
+      const anchored = `${base}/items/${id}:/${rel}`;
+      return { meta: anchored, child: `${anchored}:/children`, content: `${anchored}:/content` };
+    }
+    const db = this._driveBase();
+    const norm = this._normalizePath(path);
+    if (norm === '/') {
+      return { meta: `${db}/root`, child: `${db}/root/children`, content: `${db}/root/content` };
+    }
+    const anchored = `${db}/root:${norm}`;
+    return { meta: anchored, child: `${anchored}:/children`, content: `${anchored}:/content` };
+  }
+
+  async _statRaw(path) {
+    try {
+      const res = await this._graph(`${this._addr(path).meta}?$select=id,parentReference,folder`, { allowNotFound: true });
+      if (res.status === 404) return null;
+      return res.json();
+    } catch { return null; }
+  }
+
+  async _resolveItemId(path) {
+    const cached = this.pathCache.get(this._normalizePath(path));
+    if (cached?.id) return cached.id;
+    const meta = await this._statRaw(path);
+    if (!meta) return null;
+    this.pathCache.set(this._normalizePath(path), {
+      id: meta.id, type: meta.folder ? 'directory' : 'file',
+    });
+    return meta.id;
+  }
+
+  /**
+   * Ensure a directory (and its ancestors) exists. Graph does not create
+   * parents on a path-addressed PUT, so writes must call this on the parent.
+   * Idempotent and 409-tolerant for concurrent creators.
+   */
+  async _ensureDir(dirPath) {
+    // Root / anchor-root always exist (the anchor item is the member space root).
+    if (this._isAnchor(dirPath)) {
+      const m = /^id:([^/]+)(?:\/(.*))?$/.exec(dirPath);
+      if (!m[2]) return; // bare id: anchor — assumed to exist
+    } else if (this._normalizePath(dirPath) === '/') {
+      return;
+    }
+
+    if (await this._statRaw(dirPath)) return;
+
+    const parent = this._parentPath(dirPath);
+    await this._ensureDir(parent);
+
+    const name = this._fileName(dirPath);
+    try {
+      await this._graph(`${this._addr(parent).child}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }),
+      });
+    } catch (err) {
+      if (err.status !== 409) throw err; // 409 = already created by a concurrent writer
+    }
+  }
+
+  // ─── Token management ────────────────────────────────────────────────
+
+  async _ensureAuth() {
+    if (!this.tokens || !this.tokens.access_token) {
+      throw new NotAuthenticatedError('no_credential');
+    }
+    if (this.tokens.expires_at && (this.tokens.expires_at - 300_000) < Date.now()) {
+      if (this.tokens.refresh_token) await this._refreshToken();
+      else throw new NotAuthenticatedError('expired');
+    }
+  }
+
+  async _refreshToken() {
+    const tenant = this.connection.tenant_id;
+    const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+    const body = new URLSearchParams({
+      client_id: this.connection.client_id,
+      grant_type: 'refresh_token',
+      refresh_token: this.tokens.refresh_token,
+      scope: SCOPES,
+    });
+    const res = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new NotAuthenticatedError(
         `Token refresh failed: ${err.error_description || err.error || 'unknown error'}`
       );
     }
-
     const data = await res.json();
     this.tokens = {
       access_token: data.access_token,
       refresh_token: data.refresh_token || this.tokens.refresh_token,
-      expires_at: Date.now() + (data.expires_in * 1000),
+      expires_at: Date.now() + data.expires_in * 1000,
     };
-
     await this._writeCredential(this.tokens);
   }
 
-  // ─── Helpers ──────────────────────────────────────────────────────────
+  async _getUserEmail() {
+    try {
+      const res = await this._graph('/me?$select=mail,userPrincipalName');
+      const data = await res.json();
+      return data.mail || data.userPrincipalName || 'unknown';
+    } catch { return 'unknown'; }
+  }
+
+  async _writeCredential(tokens) {
+    await mkdir(dirname(this.credentialPath), { recursive: true });
+    await writeFile(this.credentialPath, JSON.stringify(tokens, null, 2), 'utf-8');
+  }
+
+  // ─── Path helpers (id-anchor aware) ──────────────────────────────────
 
   _normalizePath(path) {
+    if (this._isAnchor(path)) {
+      const m = /^id:([^/]+)(?:\/(.*))?$/.exec(path);
+      const rel = m[2] ? m[2].replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/+/g, '/') : '';
+      return rel ? `id:${m[1]}/${rel}` : `id:${m[1]}`;
+    }
     let p = '/' + path.replace(/^\/+/, '').replace(/\/+$/, '');
     p = p.replace(/\/+/g, '/');
     if (p === '') p = '/';
@@ -624,60 +841,33 @@ export class OneDriveAdapter {
   }
 
   _parentPath(path) {
-    const normalized = this._normalizePath(path);
-    const lastSlash = normalized.lastIndexOf('/');
-    if (lastSlash <= 0) return '/';
-    return normalized.slice(0, lastSlash);
+    if (this._isAnchor(path)) {
+      const norm = this._normalizePath(path);
+      const m = /^id:([^/]+)(?:\/(.*))?$/.exec(norm);
+      if (!m[2]) return norm; // bare anchor is its own parent (root)
+      const segs = m[2].split('/');
+      segs.pop();
+      return segs.length ? `id:${m[1]}/${segs.join('/')}` : `id:${m[1]}`;
+    }
+    const norm = this._normalizePath(path);
+    const i = norm.lastIndexOf('/');
+    return i <= 0 ? '/' : norm.slice(0, i);
   }
 
   _fileName(path) {
-    const normalized = this._normalizePath(path);
-    const lastSlash = normalized.lastIndexOf('/');
-    return normalized.slice(lastSlash + 1);
+    const norm = this._normalizePath(path);
+    return norm.slice(norm.lastIndexOf('/') + 1);
   }
 
-  async _getUserEmail() {
-    try {
-      const res = await this._graphRequest('/me', {
-        headers: { Accept: 'application/json' },
-      });
-      const data = await res.json();
-      return data.mail || data.userPrincipalName || 'unknown';
-    } catch {
-      return 'unknown';
-    }
-  }
-
-  async _writeCredential(tokens) {
-    const dir = dirname(this.credentialPath);
-    await mkdir(dir, { recursive: true });
-    await writeFile(this.credentialPath, JSON.stringify(tokens, null, 2), 'utf-8');
-  }
-
-  /**
-   * Translate Microsoft Graph API errors to AIFS errors.
-   */
   _handleGraphError(err, path) {
     const status = err.status || err.response?.status;
-
     switch (status) {
-      case 401:
-        throw new NotAuthenticatedError('expired');
-      case 403:
-        throw new AccessDeniedError(path);
-      case 404:
-        throw new FileNotFoundError(path);
-      case 409:
-        // Conflict — could be write conflict or name collision
-        throw new BackendError(`Conflict at path: ${path}. ${err.message}`, err);
-      case 412:
-        // Precondition failed — ETag mismatch
-        throw new BackendError(`Write conflict at path: ${path}. Retry with fresh read.`, err);
+      case 401: throw new NotAuthenticatedError('expired');
+      case 403: throw new AccessDeniedError(path);
+      case 404: throw new FileNotFoundError(path);
+      case 412: throw new RevisionConflictError(path, undefined, undefined);
       default:
-        throw new BackendError(
-          `Microsoft Graph API error (${status}): ${err.message}`,
-          err
-        );
+        throw new BackendError(`Microsoft Graph API error (${status ?? 'unknown'}): ${err.message}`, err);
     }
   }
 }
