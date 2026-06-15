@@ -25275,7 +25275,7 @@ function initEnvironment() {
   try {
     const opts = caCert ? { requestTls: { ca: [...tls.rootCertificates, caCert] } } : {};
     (0, import_undici.setGlobalDispatcher)(new import_undici.EnvHttpProxyAgent(opts));
-    console.log(
+    console.error(
       `[aifs] Proxy detected \u2014 fetch routed through HTTPS_PROXY` + (caCert ? ` (MITM CA trusted from ${caSource})` : "")
     );
   } catch (err) {
@@ -25298,7 +25298,7 @@ function _addCaCert(cert, source = "configured path") {
         return original(options);
       };
     })(tls.createSecureContext);
-    console.log(`[aifs] Proxy detected \u2014 added CA certificate from ${source}`);
+    console.error(`[aifs] Proxy detected \u2014 added CA certificate from ${source}`);
   } catch (err) {
     console.warn(`[aifs] Failed to apply CA certificate from ${source}: ${err.message}`);
   }

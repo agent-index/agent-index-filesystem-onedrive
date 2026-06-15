@@ -1,8 +1,8 @@
 {
   "name": "agent-index-filesystem-onedrive",
   "display_name": "Microsoft OneDrive / SharePoint",
-  "version": "2.0.2",
-  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.2 (reliability): fetch now routes through HTTPS_PROXY with the MITM CA trusted (framework 2.2.0 sets an undici proxy dispatcher — fixes 'fetch failed' in every proxied Cowork sandbox); aifs_write verifies stored byte-size on every write (not just sentinel files); required_domains now includes the tenant SharePoint content hosts. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
+  "version": "2.0.3",
+  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.3 (reliability 2): rebuilt on framework 2.2.1 — proxy diagnostics now go to stderr so byte-exact aifs_read isn't polluted in proxied sandboxes. v2.0.2 (reliability): fetch now routes through HTTPS_PROXY with the MITM CA trusted (framework 2.2.0 sets an undici proxy dispatcher — fixes 'fetch failed' in every proxied Cowork sandbox); aifs_write verifies stored byte-size on every write (not just sentinel files); required_domains now includes the tenant SharePoint content hosts. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
   "author": "agent-index",
   "license": "proprietary",
   "core_version": "1.0.0",
@@ -58,6 +58,6 @@
   "node_min_version": "18.0.0",
   "exec_bundle_entry": "dist/aifs-exec.bundle.js",
   "exec_shell_wrapper": "dist/aifs-exec.sh",
-  "bundle_built_at": "2026-06-15T02:05:33.362Z",
-  "exec_bundle_checksum": "sha256:30e3bfd778844341a5d3eadec4376d9a9ec5639f2a21279fd824ffd86cbe22a4"
+  "bundle_built_at": "2026-06-15T15:05:33.528Z",
+  "exec_bundle_checksum": "sha256:bab2868a018c025fa06117baaa817b78970ab3c2ee1ded21dd89d2607e008859"
 }
