@@ -362,6 +362,20 @@ export class OneDriveAdapter {
     try {
       let item = await doWrite();
 
+      // Universal integrity check (bug 20260614-8d20ea22-writeverify): every
+      // write is verified by size — not just sentinel-bearing files. The PUT /
+      // upload-session response carries the stored byte count, so this is free
+      // and catches truncated / partial uploads for ALL content (config, JSON,
+      // binaries). The sentinel re-read below is the opt-in stronger tail check.
+      if (item && typeof item.size === 'number' && item.size !== payload.length) {
+        throw new AifsError(
+          'AIFS_WRITE_VERIFY_FAILED',
+          `write: sent ${payload.length} bytes to "${path}" but the backend stored ${item.size} — ` +
+          `the upload was truncated or partial; do not trust the remote copy, re-write from source.`,
+          { path, expected_bytes: payload.length, actual_bytes: item.size }
+        );
+      }
+
       if (sentinelKind) {
         const verifyOnce = async () => {
           const vRes = await this._graph(addr.content, { rawResponse: true });

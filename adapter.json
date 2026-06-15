@@ -1,8 +1,8 @@
 {
   "name": "agent-index-filesystem-onedrive",
   "display_name": "Microsoft OneDrive / SharePoint",
-  "version": "2.0.1",
-  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
+  "version": "2.0.2",
+  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.2 (reliability): fetch now routes through HTTPS_PROXY with the MITM CA trusted (framework 2.2.0 sets an undici proxy dispatcher — fixes 'fetch failed' in every proxied Cowork sandbox); aifs_write verifies stored byte-size on every write (not just sentinel files); required_domains now includes the tenant SharePoint content hosts. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
   "author": "agent-index",
   "license": "proprietary",
   "core_version": "1.0.0",
@@ -50,11 +50,14 @@
   },
   "required_domains": [
     "login.microsoftonline.com",
-    "graph.microsoft.com"
+    "graph.microsoft.com",
+    "*.sharepoint.com",
+    "*-my.sharepoint.com"
   ],
+  "required_domains_note": "Content reads and >4MB uploads 302-redirect from graph.microsoft.com to the tenant content host {tenant}.sharepoint.com (and {tenant}-my.sharepoint.com for member OneDrive). These are per-tenant, so they appear here as patterns; create-org resolves and reachability-tests the concrete hosts after authentication (post-auth gate).",
   "node_min_version": "18.0.0",
   "exec_bundle_entry": "dist/aifs-exec.bundle.js",
   "exec_shell_wrapper": "dist/aifs-exec.sh",
-  "bundle_built_at": "2026-06-14T18:50:53.885Z",
-  "exec_bundle_checksum": "sha256:9fe14cb5576b4e4d03bedf3735fa1e52d8df1015589fb00fc48a2afa7102ea2c"
+  "bundle_built_at": "2026-06-15T02:05:33.362Z",
+  "exec_bundle_checksum": "sha256:30e3bfd778844341a5d3eadec4376d9a9ec5639f2a21279fd824ffd86cbe22a4"
 }
