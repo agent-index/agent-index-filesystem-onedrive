@@ -13,6 +13,9 @@ import {
   RevisionConflictError,
   NotImplementedError,
   NotProvisionedError,
+  InvalidRoleError,
+  InvalidSubjectError,
+  InvalidScopeError,
 } from '@agent-index/filesystem/errors';
 
 // ─── Platform-reliability helpers (parity with gdrive 2.6.0) ──────────
@@ -160,8 +163,8 @@ export class OneDriveAdapter {
     };
   }
 
-  _authUrl() {
-    this._codeVerifier = randomBytes(32).toString('base64url');
+  _authUrl(verifier) {
+    this._codeVerifier = verifier || randomBytes(32).toString('base64url');
     const codeChallenge = createHash('sha256').update(this._codeVerifier).digest('base64url');
     const params = new URLSearchParams({
       client_id: this.connection.client_id,
@@ -177,19 +180,44 @@ export class OneDriveAdapter {
   }
 
   async startAuth() {
-    const authUrl = this._authUrl();
+    // pkcerestart fix (bug 20260615-8d20ea22-pkcerestart): a re-issued `start`
+    // must NOT clobber a still-fresh in-flight PKCE verifier — doing so
+    // invalidated an auth code the member had already obtained. If a persisted
+    // verifier exists and is recent, REUSE it (same challenge), so an
+    // accidental second `start` is harmless. Microsoft auth codes are short-
+    // lived (~10 min), so we only reuse within that window.
+    let verifier = null;
+    let reused = false;
+    try {
+      const existing = JSON.parse(await readFile(this.pkcePath, 'utf-8'));
+      const FRESH_MS = 10 * 60 * 1000;
+      if (existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
+        verifier = existing.code_verifier;
+        reused = true;
+      }
+    } catch { /* no/invalid persisted verifier — generate a fresh one below */ }
+
+    const authUrl = this._authUrl(verifier); // verifier=null → fresh
+
     // In the on-demand exec model, `start` and `complete` run in SEPARATE
     // processes, so the PKCE verifier must survive on disk between them.
-    try {
-      await mkdir(dirname(this.pkcePath), { recursive: true });
-      await writeFile(this.pkcePath, JSON.stringify({ code_verifier: this._codeVerifier, created: Date.now() }), 'utf-8');
-    } catch (err) {
-      console.error(`[aifs] Warning: could not persist PKCE verifier: ${err.message}`);
+    // Only (re)write when we generated a fresh verifier — reusing keeps the
+    // original `created` timestamp and the already-persisted value.
+    if (!reused) {
+      try {
+        await mkdir(dirname(this.pkcePath), { recursive: true });
+        await writeFile(this.pkcePath, JSON.stringify({ code_verifier: this._codeVerifier, created: Date.now() }), 'utf-8');
+      } catch (err) {
+        console.error(`[aifs] Warning: could not persist PKCE verifier: ${err.message}`);
+      }
     }
     return {
       status: 'awaiting_code',
       auth_url: authUrl,
       message:
+        (reused
+          ? 'A sign-in is already in progress — resuming it (your earlier code, if any, is still valid). '
+          : '') +
         'Open this URL in your browser and sign in with your Microsoft 365 account. After granting ' +
         'access, the page will try to redirect to http://localhost:3939/ and fail to load — that is ' +
         'EXPECTED. Copy the FULL URL from your browser address bar (it contains "?code=...") and pass it ' +
@@ -576,13 +604,310 @@ export class OneDriveAdapter {
     }
   }
 
-  // ─── ACL ops — ACL fast-follow (not in the core-ops phase) ───────────
+  // ─── ACL ops (Release B, contract 2.0) ───────────────────────────────
+  //
+  // Sharing is ADDITIVE ONLY. OneDrive/SharePoint inheritance is never
+  // broken: `inherit:false` is deprecated (decision 2026-06-15-deprecate-
+  // inherit-false) — if a caller passes it, we ignore it (grant additively)
+  // and emit a one-line deprecation notice to stderr. The real limited-
+  // visibility pattern is structural inheritance + owned content in the
+  // member's own space, which works identically on gdrive and onedrive.
+  //
+  // Privileged ops (share/unshare/transferOwnership) are only ever invoked
+  // through the permission-change-helper (user-clicked Accept, member token);
+  // the adapter just implements the Graph call. getPermissions is read-only
+  // and directly agent-callable (the verified-outcome gate).
 
-  async share() { throw new NotImplementedError('share', 'onedrive'); }
-  async unshare() { throw new NotImplementedError('unshare', 'onedrive'); }
-  async getPermissions() { throw new NotImplementedError('getPermissions', 'onedrive'); }
-  async search() { throw new NotImplementedError('search', 'onedrive'); }
-  async transferOwnership() { throw new NotImplementedError('transferOwnership', 'onedrive'); }
+  /** AIFS role → Graph permission roles (additive grant). commenter→read (OneDrive has no commenter). */
+  _aifsRoleToGraphRoles(aifsRole) {
+    const map = { reader: ['read'], commenter: ['read'], writer: ['write'] };
+    if (!Object.prototype.hasOwnProperty.call(map, aifsRole)) {
+      throw new InvalidRoleError(aifsRole);
+    }
+    return map[aifsRole];
+  }
+
+  /** Graph permission roles[] → AIFS role. write/owner/full-control → writer; else reader. */
+  _graphRolesToAifs(roles) {
+    const r = (roles || []).map((x) => String(x).toLowerCase());
+    if (r.some((x) => x === 'write' || x === 'owner' || x.includes('full control') || x.startsWith('sp.full'))) {
+      return 'writer';
+    }
+    return 'reader';
+  }
+
+  /** Best-effort subject string for a Graph permission object. */
+  _permSubject(p) {
+    const g = p.grantedToV2 || {};
+    const u = g.user || g.siteUser;
+    if (u) return u.email || u.loginName || u.displayName || u.id || 'unknown';
+    if (g.group) return g.group.email || g.group.displayName || g.group.id || 'group';
+    if (g.siteGroup) return g.siteGroup.loginName || g.siteGroup.displayName || g.siteGroup.id || 'group';
+    if (Array.isArray(p.grantedToIdentitiesV2) && p.grantedToIdentitiesV2.length) {
+      const ids = p.grantedToIdentitiesV2
+        .map((i) => i?.user?.email || i?.user?.loginName || i?.user?.displayName)
+        .filter(Boolean);
+      if (ids.length) return ids.join(', ');
+    }
+    if (p.grantedTo?.user) return p.grantedTo.user.email || p.grantedTo.user.displayName || 'unknown';
+    if (p.link) return `link:${p.link.scope || 'unknown'}`;
+    return 'unknown';
+  }
+
+  /** Does a Graph permission object grant access to the given subject (email/loginName/objectId)? */
+  _permMatchesSubject(p, subjLower) {
+    const cands = [];
+    const g = p.grantedToV2 || {};
+    for (const k of ['user', 'siteUser', 'group', 'siteGroup']) {
+      const o = g[k];
+      if (o) cands.push(o.email, o.loginName, o.displayName, o.id);
+    }
+    if (Array.isArray(p.grantedToIdentitiesV2)) {
+      for (const i of p.grantedToIdentitiesV2) {
+        const o = i?.user || {};
+        cands.push(o.email, o.loginName, o.displayName, o.id);
+      }
+    }
+    if (p.grantedTo?.user) cands.push(p.grantedTo.user.email, p.grantedTo.user.displayName, p.grantedTo.user.id);
+    return cands.filter(Boolean).some((c) => String(c).toLowerCase() === subjLower);
+  }
+
+  /** Reverse-lookup a Graph item id to a known AIFS path via the path cache; null if unknown. */
+  _idToPath(itemId) {
+    if (!itemId) return null;
+    for (const [path, entry] of this.pathCache) {
+      if (entry?.id === itemId) return path;
+    }
+    return null;
+  }
+
+  /** Page through a Graph collection, returning all `value` entries. */
+  async _graphCollect(firstUrl) {
+    const out = [];
+    let url = firstUrl;
+    while (url) {
+      const res = await this._graph(url);
+      const data = await res.json();
+      out.push(...(data.value || []));
+      url = data['@odata.nextLink'] || null;
+    }
+    return out;
+  }
+
+  /**
+   * Grant `subject` the `role` at `path` (additive). subject = a member email
+   * or an M365 group (email or objectId). Returns { shared, permission_id, path }.
+   */
+  async share(path, subject, role, options = {}) {
+    await this._ensureAuth();
+    if (!subject || typeof subject !== 'string') {
+      throw new InvalidSubjectError(subject, 'must be an email or group address/objectId');
+    }
+    const graphRoles = this._aifsRoleToGraphRoles(role);
+    if (options.inherit === false) {
+      // O5 / decision 2026-06-15-deprecate-inherit-false: never break inheritance.
+      process.stderr.write(
+        '[aifs] note: inherit:false is deprecated and ignored on onedrive — grant applied additively (parent inheritance unchanged).\n'
+      );
+    }
+    const itemId = await this._resolveItemId(path);
+    if (!itemId) throw new PathNotFoundError(path);
+    const base = this._driveBaseFor(path);
+    const recipient = subject.includes('@') ? { email: subject } : { objectId: subject };
+    let res;
+    try {
+      res = await this._graph(`${base}/items/${itemId}/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipients: [recipient],
+          roles: graphRoles,
+          requireSignIn: true,
+          sendInvitation: false, // agent-index sends its own onboarding mail
+        }),
+      });
+    } catch (err) {
+      this._handlePermissionError(err, path, subject, role);
+    }
+    const data = await res.json().catch(() => ({}));
+    const permission_id = data?.value?.[0]?.id ?? null;
+    return { shared: true, permission_id, path, inherit_disabled: false };
+  }
+
+  /**
+   * Revoke `subject`'s explicit grant at `path`. Mirrors gdrive: list → match →
+   * DELETE by permission id. Returns { unshared: true } if a grant was removed,
+   * { unshared: false } if the subject had no explicit permission here (soft).
+   */
+  async unshare(path, subject) {
+    await this._ensureAuth();
+    if (!subject || typeof subject !== 'string') {
+      throw new InvalidSubjectError(subject, 'must be an email or group address/objectId');
+    }
+    const itemId = await this._resolveItemId(path);
+    if (!itemId) throw new PathNotFoundError(path);
+    const base = this._driveBaseFor(path);
+    let perms;
+    try {
+      perms = await this._graphCollect(`${base}/items/${itemId}/permissions`);
+    } catch (err) {
+      this._handlePermissionError(err, path, subject, null);
+    }
+    const subjLower = subject.toLowerCase();
+    const match = perms.find((p) => this._permMatchesSubject(p, subjLower));
+    if (!match) return { unshared: false, path };
+    try {
+      await this._graph(`${base}/items/${itemId}/permissions/${match.id}`, { method: 'DELETE' });
+    } catch (err) {
+      this._handlePermissionError(err, path, subject, null);
+    }
+    return { unshared: true, path };
+  }
+
+  /**
+   * List permissions at `path`. options.includeInherited (default true) controls
+   * whether inherited grants are returned. Read-only; agent-callable.
+   */
+  async getPermissions(path, options = {}) {
+    await this._ensureAuth();
+    const includeInherited = options.includeInherited !== false;
+    const itemId = await this._resolveItemId(path);
+    if (!itemId) throw new PathNotFoundError(path);
+    const base = this._driveBaseFor(path);
+    let perms;
+    try {
+      perms = await this._graphCollect(`${base}/items/${itemId}/permissions`);
+    } catch (err) {
+      this._handlePermissionError(err, path, null, null);
+    }
+    const result = [];
+    for (const p of perms) {
+      const inherited = !!p.inheritedFrom;
+      if (!includeInherited && inherited) continue;
+      let inherited_from = null;
+      if (inherited) {
+        const src = p.inheritedFrom?.id;
+        inherited_from = this._idToPath(src) || (src ? `onedrive-id:${src}` : (p.inheritedFrom?.path || null));
+      }
+      result.push({
+        subject: this._permSubject(p),
+        role: this._graphRolesToAifs(p.roles),
+        permission_id: p.id || null,
+        inherited_from,
+        granted_date: null, // Graph permission resource has no creation time
+      });
+    }
+    return { permissions: result };
+  }
+
+  /**
+   * Permission-aware enumeration under a scope. Portable subset: scope (absolute
+   * path), type (folder|file|any), nameContains, maxResults. Mirrors gdrive's
+   * contract (returns { results, truncated }). Graph returns only items the
+   * caller can access, so permission-awareness is automatic.
+   *
+   * With nameContains: Graph drive `search(q=...)` (recursive under scope).
+   * Without: a children listing of the scope (one level) — sufficient for the
+   * path→id and policy-probe usages and permission-aware. Not byte-for-byte
+   * identical to gdrive's recursive type-only search; documented as such.
+   */
+  async search(query) {
+    await this._ensureAuth();
+    const scope = query?.scope;
+    if (!scope || typeof scope !== 'string' || !(scope.startsWith('/') || this._isAnchor(scope))) {
+      throw new InvalidScopeError(scope, 'must be an absolute path or id: anchor');
+    }
+    const type = query.type || 'any';
+    if (!['folder', 'file', 'any'].includes(type)) {
+      throw new InvalidScopeError(scope, `invalid type "${type}"`);
+    }
+    const nameContains = query.nameContains || query.name_contains || null;
+    const maxResults = Math.min(query.maxResults || query.max_results || 100, 1000);
+
+    const base = this._driveBaseFor(scope);
+    const norm = this._normalizePath(scope);
+    const isRoot = !this._isAnchor(scope) && norm === '/';
+    let scopeId = null;
+    if (!isRoot) {
+      scopeId = await this._resolveItemId(scope);
+      if (!scopeId) throw new InvalidScopeError(scope, 'scope path does not exist or is not visible');
+    }
+
+    const select = '$select=id,name,folder,file,parentReference,lastModifiedDateTime,createdBy';
+    let firstUrl;
+    if (nameContains) {
+      const q = encodeURIComponent(String(nameContains));
+      const stem = isRoot ? `${base}/root` : `${base}/items/${scopeId}`;
+      firstUrl = `${stem}/search(q='${q}')?${select}&$top=${maxResults}`;
+    } else {
+      const stem = isRoot ? `${base}/root` : `${base}/items/${scopeId}`;
+      firstUrl = `${stem}/children?${select}&$top=${maxResults}`;
+    }
+
+    let items, truncated = false;
+    try {
+      let url = firstUrl;
+      items = [];
+      const res = await this._graph(url);
+      const data = await res.json();
+      items.push(...(data.value || []));
+      truncated = !!data['@odata.nextLink'] && items.length >= maxResults;
+    } catch (err) {
+      this._handleGraphError(err, scope);
+    }
+
+    const ncLower = nameContains ? String(nameContains).toLowerCase() : null;
+    const results = [];
+    for (const f of items) {
+      const isFolder = !!f.folder;
+      if (type === 'folder' && !isFolder) continue;
+      if (type === 'file' && isFolder) continue;
+      if (ncLower && !(f.name || '').toLowerCase().includes(ncLower)) continue;
+      let p = this._idToPath(f.id);
+      if (!p) {
+        const baseScope = isRoot ? '' : norm.replace(/\/$/, '');
+        p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+      }
+      results.push({
+        path: p,
+        type: isFolder ? 'folder' : 'file',
+        name: f.name,
+        owner: f.createdBy?.user?.email || f.createdBy?.user?.displayName || null,
+        modified: f.lastModifiedDateTime || null,
+      });
+      if (results.length >= maxResults) break;
+    }
+    return { results, truncated };
+  }
+
+  /**
+   * Not supported on OneDrive/SharePoint: items are owned by the user or the
+   * site, and Microsoft Graph has no per-item ownership-transfer analog to
+   * Drive's. Member departure is handled via the standards' `owner_departed`
+   * pointer annotation + M365 admin retention/site action — not a live transfer.
+   */
+  async transferOwnership() {
+    throw new NotImplementedError(
+      'transferOwnership',
+      'OneDrive/SharePoint (items are owned by the user or site; no per-item transfer in Graph — handle member departure via owner_departed + M365 admin retention)'
+    );
+  }
+
+  /** Map Graph permissions-API errors to typed AIFS errors (richer than file-op mapping). */
+  _handlePermissionError(err, path, subject, role) {
+    const status = err.status || err.response?.status;
+    const message = err?.body?.error?.message || err?.message || '';
+    if (status === 400 && /does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user/i.test(message)) {
+      throw new InvalidSubjectError(subject, 'not a known identity in this tenant');
+    }
+    switch (status) {
+      case 401: throw new NotAuthenticatedError('expired');
+      case 403: throw new AccessDeniedError(path);
+      case 404: throw new PathNotFoundError(path);
+      default:
+        throw new BackendError(`Microsoft Graph permissions error (${status ?? 'unknown'}): ${message}`, err);
+    }
+  }
 
   // ─── Large upload (session) ──────────────────────────────────────────
 
@@ -636,8 +961,20 @@ export class OneDriveAdapter {
     if (!this._isOwnDrive(path) || this._ownDriveOk) return;
     const r = await this._graph('/me/drive?$select=id', { allowNotFound: true });
     if (r.status === 404) {
+      // memberlicense (bug 20260615-8d20ea22-memberlicense): a 404 here has two
+      // distinct causes with different fixes — (a) no OneDrive license (admin
+      // must assign one) vs (b) licensed but never signed in (member self-fixes
+      // at office.com). Best-effort: inspect the error body to point at the
+      // right remedy instead of always saying "sign in".
+      let detail = '';
+      try { const b = await r.json(); detail = `${b?.error?.code || ''} ${b?.error?.message || ''}`; } catch { /* */ }
+      if (/licen[sc]|not provisioned for|no.*service plan|sharepoint.*licen|tenant.*sharepoint/i.test(detail)) {
+        throw new NotProvisionedError(
+          "Your account doesn't have a OneDrive license, so a personal space can't be created. Ask your Microsoft 365 admin to assign a license that includes OneDrive/SharePoint (it's included in Business Standard/Premium and E3). You can still use org shared collections via site membership."
+        );
+      }
       throw new NotProvisionedError(
-        "Your OneDrive isn't set up yet. Sign in once at https://office.com (open OneDrive), then re-run setup."
+        "Your OneDrive isn't set up yet. Sign in once at https://office.com (open OneDrive), then re-run setup. (If your admin says you have no OneDrive license, that's the cause instead — ask them to assign one.)"
       );
     }
     this._ownDriveOk = true;

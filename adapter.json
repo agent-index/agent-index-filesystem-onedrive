@@ -1,8 +1,8 @@
 {
   "name": "agent-index-filesystem-onedrive",
   "display_name": "Microsoft OneDrive / SharePoint",
-  "version": "2.0.3",
-  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.0.3 (reliability 2): rebuilt on framework 2.2.1 — proxy diagnostics now go to stderr so byte-exact aifs_read isn't polluted in proxied sandboxes. v2.0.2 (reliability): fetch now routes through HTTPS_PROXY with the MITM CA trusted (framework 2.2.0 sets an undici proxy dispatcher — fixes 'fetch failed' in every proxied Cowork sandbox); aifs_write verifies stored byte-size on every write (not just sentinel files); required_domains now includes the tenant SharePoint content hosts. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
+  "version": "2.1.0",
+  "description": "Filesystem adapter for Microsoft OneDrive and SharePoint document libraries. v2.1.0 (Release B — multi-member ACL): full contract-2.0 parity with gdrive — implements share/unshare/getPermissions/search on Microsoft Graph, transferOwnership returns a clear NOT_IMPLEMENTED (OneDrive/SharePoint have no per-item ownership transfer; member departure is handled via owner_departed + M365 admin retention). Sharing is ADDITIVE ONLY — inheritance is never broken (inherit:false is deprecated and ignored per decision 2026-06-15-deprecate-inherit-false); the limited-visibility pattern is structural inheritance + member-space owned content, identical on both backends. Privileged ops route only through the permission-change-helper (user-Accept, member token); getPermissions is read-only/agent-callable. v2.0.3 (reliability 2): rebuilt on framework 2.2.1 — proxy diagnostics now go to stderr so byte-exact aifs_read isn't polluted in proxied sandboxes. v2.0.2 (reliability): fetch now routes through HTTPS_PROXY with the MITM CA trusted (framework 2.2.0 sets an undici proxy dispatcher — fixes 'fetch failed' in every proxied Cowork sandbox); aifs_write verifies stored byte-size on every write (not just sentinel files); required_domains now includes the tenant SharePoint content hosts. v2.0.0 (P1 core-ops): contract-2.0 core-ops parity with gdrive — read/write/list/exists/stat/delete/copy, single-tenant public-client PKCE auth (no secret), id-anchored member-space addressing, byte-exact reads, AIFS:FILE-END sentinel write-verification, async copy, and large-file upload sessions. Revision-aware writes use Graph cTag compare + If-Match eTag backstop (write_supports_if_revision flips true once the live 412 probe passes). ACL ops (share/unshare/getPermissions/search/transferOwnership) are the fast-follow.",
   "author": "agent-index",
   "license": "proprietary",
   "core_version": "1.0.0",
@@ -14,15 +14,14 @@
     "exists",
     "stat",
     "delete",
-    "copy"
-  ],
-  "supported_operations_pending": [
+    "copy",
     "share",
     "unshare",
     "getPermissions",
     "search",
     "transferOwnership"
   ],
+  "supported_operations_pending": [],
   "write_supports_if_revision": true,
   "backend_id": "onedrive",
   "auth_method": "oauth2",
@@ -46,6 +45,11 @@
       "type": "string",
       "required": false,
       "description": "OneDrive or SharePoint document-library drive ID used as the filesystem root. Omit for the site's / user's default drive."
+    },
+    "all_members_group": {
+      "type": "string",
+      "required": false,
+      "description": "The tenant Microsoft 365 group that represents 'all org members' — its email (e.g. agentindex-members@contoso.onmicrosoft.com) or objectId (GUID). 'Share with org' grants this group reader; collaborator folders grant it writer. create-org captures or derives it from the SharePoint site's membership. Used additively only (no inheritance breaking)."
     }
   },
   "required_domains": [
@@ -58,6 +62,6 @@
   "node_min_version": "18.0.0",
   "exec_bundle_entry": "dist/aifs-exec.bundle.js",
   "exec_shell_wrapper": "dist/aifs-exec.sh",
-  "bundle_built_at": "2026-06-15T15:05:33.528Z",
-  "exec_bundle_checksum": "sha256:bab2868a018c025fa06117baaa817b78970ab3c2ee1ded21dd89d2607e008859"
+  "bundle_built_at": "2026-06-16T19:40:44.995Z",
+  "exec_bundle_checksum": "sha256:19e0ed18e4fdc335284a5945667bcc0f3cfbd2fd07e5ea5fb549cb17e6e678ed"
 }

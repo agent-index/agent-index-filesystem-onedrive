@@ -88,11 +88,50 @@ test('ops require auth (no tokens -> NOT_AUTHENTICATED)', async () => {
   await assert.rejects(() => a.read('/x'), /Not authenticated/i);
 });
 
-test('ACL ops are NOT_IMPLEMENTED in the core-ops phase', async () => {
+test('ACL ops are implemented (Release B) — they require auth, not NOT_IMPLEMENTED', async () => {
   const a = makeAdapter();
-  await assert.rejects(() => a.share(), /not implemented/i);
-  await assert.rejects(() => a.getPermissions(), /not implemented/i);
-  await assert.rejects(() => a.transferOwnership(), /not implemented/i);
+  a.tokens = null;
+  // share/unshare/getPermissions/search now go through _ensureAuth first, so
+  // with no tokens they fail NOT_AUTHENTICATED — proving they're implemented,
+  // not stubbed to "not implemented".
+  await assert.rejects(() => a.share('/x', 'u@e.com', 'reader'), /Not authenticated/i);
+  await assert.rejects(() => a.unshare('/x', 'u@e.com'), /Not authenticated/i);
+  await assert.rejects(() => a.getPermissions('/x'), /Not authenticated/i);
+  await assert.rejects(() => a.search({ scope: '/' }), /Not authenticated/i);
+});
+
+test('transferOwnership is unsupported on onedrive (NOT_IMPLEMENTED)', async () => {
+  const a = makeAdapter();
+  await assert.rejects(() => a.transferOwnership('/x', 'u@e.com'), /not implemented/i);
+});
+
+test('role mapping: AIFS <-> Graph (additive; commenter->read; writer/owner/full-control->writer)', () => {
+  const a = makeAdapter();
+  assert.deepEqual(a._aifsRoleToGraphRoles('reader'), ['read']);
+  assert.deepEqual(a._aifsRoleToGraphRoles('commenter'), ['read']);
+  assert.deepEqual(a._aifsRoleToGraphRoles('writer'), ['write']);
+  assert.throws(() => a._aifsRoleToGraphRoles('owner'), /not accepted/i);
+  assert.equal(a._graphRolesToAifs(['write']), 'writer');
+  assert.equal(a._graphRolesToAifs(['owner']), 'writer');
+  assert.equal(a._graphRolesToAifs(['sp.full control']), 'writer');
+  assert.equal(a._graphRolesToAifs(['read']), 'reader');
+});
+
+test('permission subject extraction + case-insensitive match across Graph identity shapes', () => {
+  const a = makeAdapter();
+  const pUser = { roles: ['read'], grantedToV2: { user: { email: 'A@e.com', id: 'uid1' } } };
+  assert.equal(a._permSubject(pUser), 'A@e.com');
+  assert.ok(a._permMatchesSubject(pUser, 'a@e.com'));
+
+  const pGroup = { roles: ['write'], grantedToV2: { siteGroup: { loginName: 'Members', id: 'g1' } } };
+  assert.equal(a._permSubject(pGroup), 'Members');
+  assert.ok(a._permMatchesSubject(pGroup, 'g1'));
+
+  const pMulti = { roles: ['read'], grantedToIdentitiesV2: [{ user: { email: 'X@e.com' } }, { user: { email: 'Y@e.com' } }] };
+  assert.match(a._permSubject(pMulti), /X@e\.com/);
+  assert.ok(a._permMatchesSubject(pMulti, 'y@e.com'));
+
+  assert.equal(a._permSubject({ roles: ['read'], link: { scope: 'anonymous' } }), 'link:anonymous');
 });
 
 test('startAuth persists a PKCE verifier and returns the paste-URL flow', async () => {
