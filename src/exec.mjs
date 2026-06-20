@@ -156,7 +156,12 @@ async function routeToolCall(adapter, toolName, args) {
       return adapter.getAuthStatus();
 
     case 'aifs_authenticate': {
-      const action = args.action || 'start';
+      // pkcerestart (bug 20260615-8d20ea22-pkcerestart): if the caller passes an
+      // auth_code but forgets action:"complete", infer complete — defaulting to
+      // "start" silently restarted the flow and (pre-fix) rotated the verifier,
+      // invalidating the code. With the adapter's verifier-reuse this is already
+      // harmless, but inferring intent removes the footgun entirely.
+      const action = args.action || (args.auth_code ? 'complete' : 'start');
       if (action === 'start') return adapter.startAuth();
       if (action === 'complete') return adapter.completeAuth(args.auth_code);
       throw new AifsError('INVALID_ARGS', `Unknown auth action: ${action}`,
@@ -167,6 +172,14 @@ async function routeToolCall(adapter, toolName, args) {
     case 'aifs_resolve_site': {
       requireArgs(toolName, args, ['site_url']);
       return adapter.resolveSite(args.site_url);
+    }
+
+    // Resolve a member reference (email/UPN/objectId) to the tenant's grantable
+    // identity {id, upn, mail}. Used by invite-member to persist sharing_identity
+    // (identitymap). On gdrive the analog is a passthrough.
+    case 'aifs_resolve_identity': {
+      requireArgs(toolName, args, ['ref']);
+      return adapter.resolveIdentity(args.ref);
     }
 
     // ─── v2.0 access-control ops — ACL fast-follow (currently NOT_IMPLEMENTED) ──
@@ -205,7 +218,8 @@ async function main() {
       usage: 'aifs-exec <tool_name> [json_args]',
       tools: ['aifs_read', 'aifs_write', 'aifs_list', 'aifs_exists', 'aifs_stat',
         'aifs_delete', 'aifs_copy', 'aifs_auth_status', 'aifs_authenticate', 'aifs_resolve_site',
-        'aifs_share', 'aifs_unshare', 'aifs_get_permissions', 'aifs_search', 'aifs_transfer_ownership'],
+        'aifs_resolve_identity', 'aifs_share', 'aifs_unshare', 'aifs_get_permissions',
+        'aifs_search', 'aifs_transfer_ownership'],
     }, null, 2));
     process.exit(0);
   }

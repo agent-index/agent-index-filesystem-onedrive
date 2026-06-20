@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import {
   AifsError,
   FileNotFoundError,
@@ -97,6 +98,7 @@ export class OneDriveAdapter {
     this.connection = null;
     this.credentialPath = null;
     this.pkcePath = null;
+    this.pkceTmpPath = null;
     this.tokens = null;
     this._codeVerifier = null;
     this._ownDriveOk = false; // cached: member's own OneDrive confirmed provisioned
@@ -123,9 +125,16 @@ export class OneDriveAdapter {
     }
 
     this.credentialPath = join(credentialStore, 'onedrive.json');
-    // PKCE verifier persists here between the (separate-process) start/complete
-    // auth invocations — see startAuth/completeAuth.
+    // PKCE verifier persistence between the (separate-process) start/complete
+    // auth invocations. PRIMARY is a sandbox-local tmp path (shared across exec
+    // processes in the same sandbox, NOT subject to the workspace-mount
+    // write-then-immediate-read race that lost the verifier in ms-install-4 —
+    // bug 20260615-8d20ea22-pkcerestart). The workspace path is kept as a
+    // fallback for environments where tmp isn't shared. Keyed by tenant+client
+    // so concurrent installs in one sandbox don't collide. See startAuth/completeAuth.
     this.pkcePath = join(credentialStore, 'onedrive-pkce.json');
+    const pkceKey = createHash('sha256').update(`${connection.tenant_id}:${connection.client_id}`).digest('hex').slice(0, 16);
+    this.pkceTmpPath = join(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
       this.tokens = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
     } catch {
@@ -179,37 +188,68 @@ export class OneDriveAdapter {
     return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?${params.toString()}`;
   }
 
+  /** PKCE verifier persistence paths: sandbox-local tmp first (reliable across
+   *  exec processes), workspace second (fallback). */
+  _pkcePaths() {
+    return [this.pkceTmpPath, this.pkcePath].filter(Boolean);
+  }
+
+  /** Persist the verifier to every path (best-effort). Returns true if any write landed. */
+  async _persistVerifier(verifier) {
+    const payload = JSON.stringify({ code_verifier: verifier, created: Date.now() });
+    let wrote = false;
+    for (const p of this._pkcePaths()) {
+      try {
+        await mkdir(dirname(p), { recursive: true });
+        await writeFile(p, payload, 'utf-8');
+        wrote = true;
+      } catch (err) {
+        console.error(`[aifs] Warning: could not persist PKCE verifier to ${p}: ${err.message}`);
+      }
+    }
+    return wrote;
+  }
+
+  /** Read the persisted verifier from the first path that has a valid one. */
+  async _readVerifier() {
+    for (const p of this._pkcePaths()) {
+      try {
+        const v = JSON.parse(await readFile(p, 'utf-8'));
+        if (v?.code_verifier) return v;
+      } catch { /* try next path */ }
+    }
+    return null;
+  }
+
+  /** Remove the persisted verifier from all paths (post-completion cleanup). */
+  async _clearVerifier() {
+    for (const p of this._pkcePaths()) {
+      try { await rm(p, { force: true }); } catch { /* */ }
+    }
+  }
+
   async startAuth() {
-    // pkcerestart fix (bug 20260615-8d20ea22-pkcerestart): a re-issued `start`
-    // must NOT clobber a still-fresh in-flight PKCE verifier — doing so
-    // invalidated an auth code the member had already obtained. If a persisted
-    // verifier exists and is recent, REUSE it (same challenge), so an
-    // accidental second `start` is harmless. Microsoft auth codes are short-
-    // lived (~10 min), so we only reuse within that window.
+    // pkcerestart (bug 20260615-8d20ea22-pkcerestart): TWO defenses.
+    // (1) Persistence: write the verifier to a sandbox-local tmp path (primary)
+    //     so it reliably survives between the separate start/complete exec
+    //     processes — the workspace-mount write was lost to a write-then-read
+    //     race in ms-install-4 ("verifier didn't carry over"), which is the real
+    //     root cause. (2) Reuse: if a still-fresh verifier is already persisted,
+    //     REUSE it (same challenge) so an accidentally re-issued `start` doesn't
+    //     rotate it and invalidate an already-obtained code. Codes are ~10 min.
     let verifier = null;
     let reused = false;
-    try {
-      const existing = JSON.parse(await readFile(this.pkcePath, 'utf-8'));
-      const FRESH_MS = 10 * 60 * 1000;
-      if (existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
-        verifier = existing.code_verifier;
-        reused = true;
-      }
-    } catch { /* no/invalid persisted verifier — generate a fresh one below */ }
+    const existing = await this._readVerifier();
+    const FRESH_MS = 10 * 60 * 1000;
+    if (existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
+      verifier = existing.code_verifier;
+      reused = true;
+    }
 
     const authUrl = this._authUrl(verifier); // verifier=null → fresh
 
-    // In the on-demand exec model, `start` and `complete` run in SEPARATE
-    // processes, so the PKCE verifier must survive on disk between them.
-    // Only (re)write when we generated a fresh verifier — reusing keeps the
-    // original `created` timestamp and the already-persisted value.
     if (!reused) {
-      try {
-        await mkdir(dirname(this.pkcePath), { recursive: true });
-        await writeFile(this.pkcePath, JSON.stringify({ code_verifier: this._codeVerifier, created: Date.now() }), 'utf-8');
-      } catch (err) {
-        console.error(`[aifs] Warning: could not persist PKCE verifier: ${err.message}`);
-      }
+      await this._persistVerifier(this._codeVerifier);
     }
     return {
       status: 'awaiting_code',
@@ -230,10 +270,12 @@ export class OneDriveAdapter {
     authCode = _extractAuthCode(authCode);
     if (!authCode) throw new AuthFailedError('No authorization code provided');
 
-    // Recover the PKCE verifier persisted by startAuth (separate process).
+    // Recover the PKCE verifier persisted by startAuth (separate process) —
+    // tmp-first, then workspace fallback (see _readVerifier / pkcerestart).
     let verifier = this._codeVerifier;
     if (!verifier) {
-      try { verifier = JSON.parse(await readFile(this.pkcePath, 'utf-8')).code_verifier; } catch { /* */ }
+      const v = await this._readVerifier();
+      verifier = v?.code_verifier || null;
     }
     if (!verifier) {
       throw new AuthFailedError(
@@ -285,7 +327,7 @@ export class OneDriveAdapter {
       expires_at: Date.now() + data.expires_in * 1000,
     };
     await this._writeCredential(this.tokens);
-    try { await rm(this.pkcePath, { force: true }); } catch { /* best-effort cleanup */ }
+    await this._clearVerifier(); // remove verifier from tmp + workspace
     const email = await this._getUserEmail();
     return {
       status: 'authenticated',
@@ -897,8 +939,15 @@ export class OneDriveAdapter {
   _handlePermissionError(err, path, subject, role) {
     const status = err.status || err.response?.status;
     const message = err?.body?.error?.message || err?.message || '';
-    if (status === 400 && /does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user/i.test(message)) {
-      throw new InvalidSubjectError(subject, 'not a known identity in this tenant');
+    // identitymap diagnosability: Graph returns a generic "sharingFailed / please
+    // try again later" when the recipient doesn't resolve in the tenant — it
+    // LOOKS transient but isn't. Classify it as an unresolvable subject so the
+    // caller stops retrying and fixes the identity (bug 20260617-8d20ea22-identitymap).
+    if (/does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user|sharingFailed|problem sharing/i.test(message)) {
+      throw new InvalidSubjectError(
+        subject,
+        'could not be resolved to a grantable identity in this tenant — resolve the recipient (aifs_resolve_identity) and grant the resolved UPN/objectId, not the roster email'
+      );
     }
     switch (status) {
       case 401: throw new NotAuthenticatedError('expired');
@@ -907,6 +956,42 @@ export class OneDriveAdapter {
       default:
         throw new BackendError(`Microsoft Graph permissions error (${status ?? 'unknown'}): ${message}`, err);
     }
+  }
+
+  /**
+   * Resolve a member reference (email / UPN / objectId) to the tenant's
+   * grantable identity. Returns { id, upn, mail } — `id` (objectId) is the most
+   * robust recipient for a Graph invite. Throws InvalidSubjectError if no user
+   * matches. This is the onedrive answer to identitymap: the roster email is
+   * often NOT the grantable identity, and the resolution is per-user (UPN for
+   * one member, a proxy/vanity for another), so we look it up rather than guess.
+   * gdrive's analog is a no-op passthrough (the email IS the grantable identity).
+   * Callers (invite-member) resolve ONCE at invite and persist the result as the
+   * member's `sharing_identity`; share-spec composition then uses that.
+   */
+  async resolveIdentity(ref) {
+    await this._ensureAuth();
+    if (!ref || typeof ref !== 'string') throw new InvalidSubjectError(ref, 'empty reference');
+    const r = String(ref).replace(/^mailto:/i, '').trim();
+    const pick = (u) => ({ id: u.id, upn: u.userPrincipalName || null, mail: u.mail || null });
+    // 1) Direct GET — ref is already a UPN or objectId.
+    try {
+      const res = await this._graph(`/users/${encodeURIComponent(r)}?$select=id,userPrincipalName,mail`, { allowNotFound: true });
+      if (res.status !== 404) { const u = await res.json(); if (u?.id) return pick(u); }
+    } catch { /* fall through to filter */ }
+    // 2) Filter on mail / UPN / proxyAddresses (proxy covers vanity addresses
+    //    like bill@agent-index.ai -> BillSalak@...onmicrosoft.com). proxyAddresses
+    //    filtering needs the advanced-query header.
+    const esc = r.replace(/'/g, "''");
+    const filt = `mail eq '${esc}' or userPrincipalName eq '${esc}' or proxyAddresses/any(p:p eq 'SMTP:${esc}') or proxyAddresses/any(p:p eq 'smtp:${esc}')`;
+    try {
+      const res = await this._graph(
+        `/users?$select=id,userPrincipalName,mail&$count=true&$filter=${encodeURIComponent(filt)}`,
+        { headers: { ConsistencyLevel: 'eventual' }, allowNotFound: true }
+      );
+      if (res.status !== 404) { const data = await res.json(); const u = (data.value || [])[0]; if (u?.id) return pick(u); }
+    } catch { /* fall through to throw */ }
+    throw new InvalidSubjectError(ref, 'no matching user found in the tenant (checked UPN, mail, and proxy addresses)');
   }
 
   // ─── Large upload (session) ──────────────────────────────────────────

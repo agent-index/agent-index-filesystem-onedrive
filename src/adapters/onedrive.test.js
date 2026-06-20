@@ -134,21 +134,54 @@ test('permission subject extraction + case-insensitive match across Graph identi
   assert.equal(a._permSubject({ roles: ['read'], link: { scope: 'anonymous' } }), 'link:anonymous');
 });
 
-test('startAuth persists a PKCE verifier and returns the paste-URL flow', async () => {
+test('startAuth persists a PKCE verifier (tmp + workspace) and returns the paste-URL flow', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-'));
+  const a = new OneDriveAdapter();
   try {
-    const a = new OneDriveAdapter();
-    await a.initialize({ tenant_id: 'TENANT', client_id: 'CID' }, dir);
+    await a.initialize({ tenant_id: 'T-START', client_id: 'C-START' }, dir);
     const r = await a.startAuth();
     assert.equal(r.status, 'awaiting_code');
-    assert.match(r.auth_url, /login\.microsoftonline\.com\/TENANT\/oauth2\/v2\.0\/authorize/);
-    assert.match(r.auth_url, /code_challenge=/);
+    assert.match(r.auth_url, /login\.microsoftonline\.com\/T-START\/oauth2\/v2\.0\/authorize/);
     assert.match(r.auth_url, /code_challenge_method=S256/);
-    const pkce = JSON.parse(await readFile(path.join(dir, 'onedrive-pkce.json'), 'utf8'));
-    assert.ok(pkce.code_verifier && pkce.code_verifier.length > 20, 'verifier persisted');
+    // verifier written to BOTH the sandbox-local tmp (primary) and workspace (fallback)
+    assert.equal(a._pkcePaths().length, 2);
+    const ws = JSON.parse(await readFile(path.join(dir, 'onedrive-pkce.json'), 'utf8'));
+    assert.ok(ws.code_verifier && ws.code_verifier.length > 20, 'workspace verifier persisted');
+    const viaHelper = await a._readVerifier();
+    assert.equal(viaHelper.code_verifier, ws.code_verifier, '_readVerifier round-trips');
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await a._clearVerifier(); await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('startAuth REUSES a still-fresh persisted verifier (pkcerestart — re-issued start is harmless)', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-reuse-'));
+  const a = new OneDriveAdapter();
+  try {
+    await a.initialize({ tenant_id: 'T-REUSE', client_id: 'C-REUSE' }, dir);
+    const r1 = await a.startAuth();
+    const ch1 = new URL(r1.auth_url).searchParams.get('code_challenge');
+    const r2 = await a.startAuth(); // accidental second start
+    const ch2 = new URL(r2.auth_url).searchParams.get('code_challenge');
+    assert.equal(ch1, ch2, 'same challenge -> the first code is still valid');
+    assert.match(r2.message, /already in progress|resuming/i);
+  } finally {
+    await a._clearVerifier(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveIdentity: requires auth, rejects empty ref', async () => {
+  const a = makeAdapter();
+  a.tokens = null;
+  await assert.rejects(() => a.resolveIdentity('x@e.com'), /Not authenticated/i);
+  a.tokens = { access_token: 't', expires_at: Date.now() + 3600_000 };
+  await assert.rejects(() => a.resolveIdentity(''), /INVALID_SUBJECT|not a valid identity/i);
+});
+
+test('_handlePermissionError: generic sharingFailed is classified as unresolvable subject (not transient)', () => {
+  const a = makeAdapter();
+  const err = { status: 400, body: { error: { message: 'sharingFailed: There was a problem sharing, please try again later.' } } };
+  assert.throws(() => a._handlePermissionError(err, '/x', 'who@e.com', 'reader'), /INVALID_SUBJECT|not a valid identity/i);
 });
 
 test('NotProvisionedError carries NOT_PROVISIONED + needs_provision flag', () => {

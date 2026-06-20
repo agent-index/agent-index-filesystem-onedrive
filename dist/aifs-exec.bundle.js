@@ -37632,6 +37632,7 @@ var NotProvisionedError = class extends AifsError {
 import { readFile as readFile2, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname as dirname2, join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 var AIFS_SENTINEL = "AIFS:FILE-END";
 function detectSentinel(content) {
   if (typeof content !== "string" || content.length === 0)
@@ -37685,6 +37686,7 @@ var OneDriveAdapter = class {
     this.connection = null;
     this.credentialPath = null;
     this.pkcePath = null;
+    this.pkceTmpPath = null;
     this.tokens = null;
     this._codeVerifier = null;
     this._ownDriveOk = false;
@@ -37705,6 +37707,8 @@ var OneDriveAdapter = class {
     }
     this.credentialPath = join(credentialStore, "onedrive.json");
     this.pkcePath = join(credentialStore, "onedrive-pkce.json");
+    const pkceKey = createHash("sha256").update(`${connection.tenant_id}:${connection.client_id}`).digest("hex").slice(0, 16);
+    this.pkceTmpPath = join(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
       this.tokens = JSON.parse(await readFile2(this.credentialPath, "utf-8"));
     } catch {
@@ -37755,26 +37759,59 @@ var OneDriveAdapter = class {
     const tenant = this.connection.tenant_id;
     return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?${params.toString()}`;
   }
+  /** PKCE verifier persistence paths: sandbox-local tmp first (reliable across
+   *  exec processes), workspace second (fallback). */
+  _pkcePaths() {
+    return [this.pkceTmpPath, this.pkcePath].filter(Boolean);
+  }
+  /** Persist the verifier to every path (best-effort). Returns true if any write landed. */
+  async _persistVerifier(verifier) {
+    const payload = JSON.stringify({ code_verifier: verifier, created: Date.now() });
+    let wrote = false;
+    for (const p of this._pkcePaths()) {
+      try {
+        await mkdir(dirname2(p), { recursive: true });
+        await writeFile(p, payload, "utf-8");
+        wrote = true;
+      } catch (err) {
+        console.error(`[aifs] Warning: could not persist PKCE verifier to ${p}: ${err.message}`);
+      }
+    }
+    return wrote;
+  }
+  /** Read the persisted verifier from the first path that has a valid one. */
+  async _readVerifier() {
+    for (const p of this._pkcePaths()) {
+      try {
+        const v = JSON.parse(await readFile2(p, "utf-8"));
+        if (v?.code_verifier)
+          return v;
+      } catch {
+      }
+    }
+    return null;
+  }
+  /** Remove the persisted verifier from all paths (post-completion cleanup). */
+  async _clearVerifier() {
+    for (const p of this._pkcePaths()) {
+      try {
+        await rm(p, { force: true });
+      } catch {
+      }
+    }
+  }
   async startAuth() {
     let verifier = null;
     let reused = false;
-    try {
-      const existing = JSON.parse(await readFile2(this.pkcePath, "utf-8"));
-      const FRESH_MS = 10 * 60 * 1e3;
-      if (existing?.code_verifier && existing.created && Date.now() - existing.created < FRESH_MS) {
-        verifier = existing.code_verifier;
-        reused = true;
-      }
-    } catch {
+    const existing = await this._readVerifier();
+    const FRESH_MS = 10 * 60 * 1e3;
+    if (existing?.code_verifier && existing.created && Date.now() - existing.created < FRESH_MS) {
+      verifier = existing.code_verifier;
+      reused = true;
     }
     const authUrl = this._authUrl(verifier);
     if (!reused) {
-      try {
-        await mkdir(dirname2(this.pkcePath), { recursive: true });
-        await writeFile(this.pkcePath, JSON.stringify({ code_verifier: this._codeVerifier, created: Date.now() }), "utf-8");
-      } catch (err) {
-        console.error(`[aifs] Warning: could not persist PKCE verifier: ${err.message}`);
-      }
+      await this._persistVerifier(this._codeVerifier);
     }
     return {
       status: "awaiting_code",
@@ -37788,10 +37825,8 @@ var OneDriveAdapter = class {
       throw new AuthFailedError("No authorization code provided");
     let verifier = this._codeVerifier;
     if (!verifier) {
-      try {
-        verifier = JSON.parse(await readFile2(this.pkcePath, "utf-8")).code_verifier;
-      } catch {
-      }
+      const v = await this._readVerifier();
+      verifier = v?.code_verifier || null;
     }
     if (!verifier) {
       throw new AuthFailedError(
@@ -37837,10 +37872,7 @@ var OneDriveAdapter = class {
       expires_at: Date.now() + data.expires_in * 1e3
     };
     await this._writeCredential(this.tokens);
-    try {
-      await rm(this.pkcePath, { force: true });
-    } catch {
-    }
+    await this._clearVerifier();
     const email3 = await this._getUserEmail();
     return {
       status: "authenticated",
@@ -38435,8 +38467,11 @@ var OneDriveAdapter = class {
   _handlePermissionError(err, path, subject, role) {
     const status = err.status || err.response?.status;
     const message = err?.body?.error?.message || err?.message || "";
-    if (status === 400 && /does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user/i.test(message)) {
-      throw new InvalidSubjectError(subject, "not a known identity in this tenant");
+    if (/does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user|sharingFailed|problem sharing/i.test(message)) {
+      throw new InvalidSubjectError(
+        subject,
+        "could not be resolved to a grantable identity in this tenant \u2014 resolve the recipient (aifs_resolve_identity) and grant the resolved UPN/objectId, not the roster email"
+      );
     }
     switch (status) {
       case 401:
@@ -38448,6 +38483,49 @@ var OneDriveAdapter = class {
       default:
         throw new BackendError(`Microsoft Graph permissions error (${status ?? "unknown"}): ${message}`, err);
     }
+  }
+  /**
+   * Resolve a member reference (email / UPN / objectId) to the tenant's
+   * grantable identity. Returns { id, upn, mail } — `id` (objectId) is the most
+   * robust recipient for a Graph invite. Throws InvalidSubjectError if no user
+   * matches. This is the onedrive answer to identitymap: the roster email is
+   * often NOT the grantable identity, and the resolution is per-user (UPN for
+   * one member, a proxy/vanity for another), so we look it up rather than guess.
+   * gdrive's analog is a no-op passthrough (the email IS the grantable identity).
+   * Callers (invite-member) resolve ONCE at invite and persist the result as the
+   * member's `sharing_identity`; share-spec composition then uses that.
+   */
+  async resolveIdentity(ref) {
+    await this._ensureAuth();
+    if (!ref || typeof ref !== "string")
+      throw new InvalidSubjectError(ref, "empty reference");
+    const r = String(ref).replace(/^mailto:/i, "").trim();
+    const pick2 = (u) => ({ id: u.id, upn: u.userPrincipalName || null, mail: u.mail || null });
+    try {
+      const res = await this._graph(`/users/${encodeURIComponent(r)}?$select=id,userPrincipalName,mail`, { allowNotFound: true });
+      if (res.status !== 404) {
+        const u = await res.json();
+        if (u?.id)
+          return pick2(u);
+      }
+    } catch {
+    }
+    const esc2 = r.replace(/'/g, "''");
+    const filt = `mail eq '${esc2}' or userPrincipalName eq '${esc2}' or proxyAddresses/any(p:p eq 'SMTP:${esc2}') or proxyAddresses/any(p:p eq 'smtp:${esc2}')`;
+    try {
+      const res = await this._graph(
+        `/users?$select=id,userPrincipalName,mail&$count=true&$filter=${encodeURIComponent(filt)}`,
+        { headers: { ConsistencyLevel: "eventual" }, allowNotFound: true }
+      );
+      if (res.status !== 404) {
+        const data = await res.json();
+        const u = (data.value || [])[0];
+        if (u?.id)
+          return pick2(u);
+      }
+    } catch {
+    }
+    throw new InvalidSubjectError(ref, "no matching user found in the tenant (checked UPN, mail, and proxy addresses)");
   }
   // ─── Large upload (session) ──────────────────────────────────────────
   async _uploadLarge(addr, payload, etagForIfMatch) {
@@ -38902,7 +38980,7 @@ async function routeToolCall(adapter, toolName, args) {
     case "aifs_auth_status":
       return adapter.getAuthStatus();
     case "aifs_authenticate": {
-      const action = args.action || "start";
+      const action = args.action || (args.auth_code ? "complete" : "start");
       if (action === "start")
         return adapter.startAuth();
       if (action === "complete")
@@ -38916,6 +38994,10 @@ async function routeToolCall(adapter, toolName, args) {
     case "aifs_resolve_site": {
       requireArgs(toolName, args, ["site_url"]);
       return adapter.resolveSite(args.site_url);
+    }
+    case "aifs_resolve_identity": {
+      requireArgs(toolName, args, ["ref"]);
+      return adapter.resolveIdentity(args.ref);
     }
     case "aifs_share": {
       requireArgs(toolName, args, [["path", "path"], "subject", "role"]);
@@ -38957,6 +39039,7 @@ async function main() {
         "aifs_auth_status",
         "aifs_authenticate",
         "aifs_resolve_site",
+        "aifs_resolve_identity",
         "aifs_share",
         "aifs_unshare",
         "aifs_get_permissions",
