@@ -178,6 +178,62 @@ test('resolveIdentity: requires auth, rejects empty ref', async () => {
   await assert.rejects(() => a.resolveIdentity(''), /INVALID_SUBJECT|not a valid identity/i);
 });
 
+test('resolveIdentity: a 403 (no directory-read permission) surfaces ACCESS_DENIED, NOT INVALID_SUBJECT (identityperm/errormask)', async () => {
+  const a = makeAdapter();
+  a.tokens = { access_token: 't', expires_at: Date.now() + 3600_000 };
+  // Both the direct GET and the $filter come back 403 Authorization_RequestDenied
+  // — the app lacks User.Read.All. The user may well exist; this must NOT be
+  // reported as "no matching user".
+  a._graph = async () => {
+    const e = new Error('Insufficient privileges to complete the operation.');
+    e.status = 403;
+    e.body = { error: { code: 'Authorization_RequestDenied', message: 'Insufficient privileges to complete the operation.' } };
+    throw e;
+  };
+  await assert.rejects(
+    () => a.resolveIdentity('testproduction@AgentIndex.onmicrosoft.com'),
+    (err) => {
+      assert.equal(err.code, 'ACCESS_DENIED', 'must be ACCESS_DENIED, not INVALID_SUBJECT');
+      assert.match(err.message, /User\.Read\.All/);
+      assert.match(err.message, /admin consent|re-authenticate/i);
+      assert.doesNotMatch(err.message, /no matching user/i);
+      return true;
+    }
+  );
+});
+
+test('resolveIdentity: a genuine empty result (200, no match) is INVALID_SUBJECT', async () => {
+  const a = makeAdapter();
+  a.tokens = { access_token: 't', expires_at: Date.now() + 3600_000 };
+  // Direct GET returns a body with no id; $filter returns an empty value[] — a
+  // real "this user does not exist" outcome, distinct from the 403 above.
+  a._graph = async (url) => ({
+    status: 200,
+    json: async () => (/\$filter=/.test(url) ? { value: [] } : {}),
+  });
+  await assert.rejects(
+    () => a.resolveIdentity('ghost@AgentIndex.onmicrosoft.com'),
+    (err) => { assert.equal(err.code, 'INVALID_SUBJECT'); return true; }
+  );
+});
+
+test('startAuth requests the User.Read.All directory-read scope (identityperm)', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'od-scope-'));
+  const a = new OneDriveAdapter();
+  try {
+    await a.initialize({ tenant_id: 'T-SCOPE', client_id: 'C-SCOPE' }, dir);
+    const r = await a.startAuth();
+    const scope = new URL(r.auth_url).searchParams.get('scope') || '';
+    assert.match(scope, /\bUser\.Read\.All\b/, 'resolveIdentity needs directory read');
+    assert.match(scope, /\bFiles\.ReadWrite\.All\b/);
+    assert.match(scope, /\bSites\.ReadWrite\.All\b/);
+    assert.match(scope, /\boffline_access\b/);
+  } finally {
+    await a._clearVerifier?.();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('_handlePermissionError: generic sharingFailed is classified as unresolvable subject (not transient)', () => {
   const a = makeAdapter();
   const err = { status: 400, body: { error: { message: 'sharingFailed: There was a problem sharing, please try again later.' } } };

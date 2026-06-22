@@ -37656,7 +37656,7 @@ var SIMPLE_UPLOAD_MAX_BYTES = 4 * 1024 * 1024;
 var UPLOAD_CHUNK_BYTES = 5 * 320 * 1024;
 var GRAPH_ROOT = "https://graph.microsoft.com/v1.0";
 var REDIRECT_URI = "http://localhost:3939/";
-var SCOPES = "User.Read Files.ReadWrite.All Sites.ReadWrite.All offline_access";
+var SCOPES = "User.Read User.Read.All Files.ReadWrite.All Sites.ReadWrite.All offline_access";
 function _extractAuthCode(input) {
   if (input == null)
     return void 0;
@@ -38501,6 +38501,8 @@ var OneDriveAdapter = class {
       throw new InvalidSubjectError(ref, "empty reference");
     const r = String(ref).replace(/^mailto:/i, "").trim();
     const pick2 = (u) => ({ id: u.id, upn: u.userPrincipalName || null, mail: u.mail || null });
+    const isPermissionDenied = (e) => e?.status === 403 || /Authorization_RequestDenied|Insufficient privileges|insufficient.*scope/i.test(e?.body?.error?.message || e?.message || "");
+    let denied = false;
     try {
       const res = await this._graph(`/users/${encodeURIComponent(r)}?$select=id,userPrincipalName,mail`, { allowNotFound: true });
       if (res.status !== 404) {
@@ -38508,7 +38510,9 @@ var OneDriveAdapter = class {
         if (u?.id)
           return pick2(u);
       }
-    } catch {
+    } catch (e) {
+      if (isPermissionDenied(e))
+        denied = true;
     }
     const esc2 = r.replace(/'/g, "''");
     const filt = `mail eq '${esc2}' or userPrincipalName eq '${esc2}' or proxyAddresses/any(p:p eq 'SMTP:${esc2}') or proxyAddresses/any(p:p eq 'smtp:${esc2}')`;
@@ -38523,7 +38527,15 @@ var OneDriveAdapter = class {
         if (u?.id)
           return pick2(u);
       }
-    } catch {
+    } catch (e) {
+      if (isPermissionDenied(e))
+        denied = true;
+    }
+    if (denied) {
+      throw new AccessDeniedError(
+        r,
+        'resolve the member identity \u2014 the Entra app registration is missing the delegated Microsoft Graph permission "User.Read.All". Add it to the app, grant admin consent, then re-authenticate (aifs_authenticate). The account most likely exists; this is a consent gap, not a missing user. Operation'
+      );
     }
     throw new InvalidSubjectError(ref, "no matching user found in the tenant (checked UPN, mail, and proxy addresses)");
   }
@@ -38996,8 +39008,9 @@ async function routeToolCall(adapter, toolName, args) {
       return adapter.resolveSite(args.site_url);
     }
     case "aifs_resolve_identity": {
-      requireArgs(toolName, args, ["ref"]);
-      return adapter.resolveIdentity(args.ref);
+      const ref = args.ref ?? args.email ?? args.subject ?? args.identity ?? args.upn ?? args.user ?? args.member ?? args.recipient;
+      requireArgs(toolName, { ref }, ["ref"]);
+      return adapter.resolveIdentity(ref);
     }
     case "aifs_share": {
       requireArgs(toolName, args, [["path", "path"], "subject", "role"]);

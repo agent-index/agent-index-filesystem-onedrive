@@ -49,7 +49,11 @@ const UPLOAD_CHUNK_BYTES = 5 * 320 * 1024; // 1600 KiB
 
 const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0';
 const REDIRECT_URI = 'http://localhost:3939/'; // matches the registered app (single-tenant public client)
-const SCOPES = 'User.Read Files.ReadWrite.All Sites.ReadWrite.All offline_access';
+// User.Read.All (delegated, admin-consent-required) is needed by resolveIdentity:
+// GET /users/{id} and the $filter on proxyAddresses both require directory read,
+// which plain User.Read ("read your OWN profile") does NOT grant. Without it the
+// identitymap resolver 403s on every lookup (bug 20260620-8d20ea22-identityperm).
+const SCOPES = 'User.Read User.Read.All Files.ReadWrite.All Sites.ReadWrite.All offline_access';
 
 /** Accept either a raw OAuth code or a pasted callback URL; return the code. */
 function _extractAuthCode(input) {
@@ -974,11 +978,22 @@ export class OneDriveAdapter {
     if (!ref || typeof ref !== 'string') throw new InvalidSubjectError(ref, 'empty reference');
     const r = String(ref).replace(/^mailto:/i, '').trim();
     const pick = (u) => ({ id: u.id, upn: u.userPrincipalName || null, mail: u.mail || null });
+    // A 403 / Authorization_RequestDenied here does NOT mean "no such user" — it
+    // means the app registration can't READ THE DIRECTORY (missing User.Read.All).
+    // Swallowing it as a fall-through and then throwing INVALID_SUBJECT is the
+    // errormask half of bug 20260620-8d20ea22-identityperm: it sent a real install
+    // hunting for an account that demonstrably existed. Detect it and surface a
+    // distinct, actionable ACCESS_DENIED instead; only a genuine 404/empty result
+    // is an unresolvable subject.
+    const isPermissionDenied = (e) =>
+      e?.status === 403 ||
+      /Authorization_RequestDenied|Insufficient privileges|insufficient.*scope/i.test(e?.body?.error?.message || e?.message || '');
+    let denied = false;
     // 1) Direct GET — ref is already a UPN or objectId.
     try {
       const res = await this._graph(`/users/${encodeURIComponent(r)}?$select=id,userPrincipalName,mail`, { allowNotFound: true });
       if (res.status !== 404) { const u = await res.json(); if (u?.id) return pick(u); }
-    } catch { /* fall through to filter */ }
+    } catch (e) { if (isPermissionDenied(e)) denied = true; /* else fall through to filter */ }
     // 2) Filter on mail / UPN / proxyAddresses (proxy covers vanity addresses
     //    like bill@agent-index.ai -> BillSalak@...onmicrosoft.com). proxyAddresses
     //    filtering needs the advanced-query header.
@@ -990,7 +1005,13 @@ export class OneDriveAdapter {
         { headers: { ConsistencyLevel: 'eventual' }, allowNotFound: true }
       );
       if (res.status !== 404) { const data = await res.json(); const u = (data.value || [])[0]; if (u?.id) return pick(u); }
-    } catch { /* fall through to throw */ }
+    } catch (e) { if (isPermissionDenied(e)) denied = true; /* else fall through to throw */ }
+    if (denied) {
+      throw new AccessDeniedError(
+        r,
+        'resolve the member identity — the Entra app registration is missing the delegated Microsoft Graph permission "User.Read.All". Add it to the app, grant admin consent, then re-authenticate (aifs_authenticate). The account most likely exists; this is a consent gap, not a missing user. Operation',
+      );
+    }
     throw new InvalidSubjectError(ref, 'no matching user found in the tenant (checked UPN, mail, and proxy addresses)');
   }
 

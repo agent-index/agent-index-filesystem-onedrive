@@ -178,8 +178,14 @@ async function routeToolCall(adapter, toolName, args) {
     // identity {id, upn, mail}. Used by invite-member to persist sharing_identity
     // (identitymap). On gdrive the analog is a passthrough.
     case 'aifs_resolve_identity': {
-      requireArgs(toolName, args, ['ref']);
-      return adapter.resolveIdentity(args.ref);
+      // Accept the common aliases callers reach for (email/subject/identity/upn/…)
+      // rather than requiring exactly `ref` — requiring the one exact key cost a
+      // wasted round-trip in a real invite (resolve-ref-arg hiccup). Coalesce, then
+      // still requireArgs so a truly empty call gets the clear missing-arg error.
+      const ref = args.ref ?? args.email ?? args.subject ?? args.identity
+        ?? args.upn ?? args.user ?? args.member ?? args.recipient;
+      requireArgs(toolName, { ref }, ['ref']);
+      return adapter.resolveIdentity(ref);
     }
 
     // ─── v2.0 access-control ops — ACL fast-follow (currently NOT_IMPLEMENTED) ──
