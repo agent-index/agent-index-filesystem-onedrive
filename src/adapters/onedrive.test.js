@@ -51,6 +51,31 @@ test('_addr: id-anchors resolve against the member\'s own OneDrive (/me/drive)',
   assert.equal(rel.child, '/me/drive/items/01ABCID:/Agent-Index-Private/note.md:/children');
 });
 
+test('_addr: cross-drive anchors route to /drives/{driveId} (crossdriveread, C.1.3)', () => {
+  const a = makeAdapter();
+  // id:{driveId}:{itemId} — owner's drive, bare item
+  const bare = a._addr('id:bDRIVE!ZZ:01ITEMID');
+  assert.equal(bare.meta, '/drives/bDRIVE!ZZ/items/01ITEMID');
+  assert.equal(bare.content, '/drives/bDRIVE!ZZ/items/01ITEMID/content');
+  assert.equal(bare.child, '/drives/bDRIVE!ZZ/items/01ITEMID/children');
+  // id:{driveId}:{itemId}/rel — a doc inside a shared folder on the owner's drive
+  const rel = a._addr('id:bDRIVE!ZZ:01ITEMID/doc.md');
+  assert.equal(rel.meta, '/drives/bDRIVE!ZZ/items/01ITEMID:/doc.md');
+  assert.equal(rel.content, '/drives/bDRIVE!ZZ/items/01ITEMID:/doc.md:/content');
+  // a bare (own-drive) anchor is unchanged — backward compatible
+  assert.equal(a._addr('id:01ITEMID').meta, '/me/drive/items/01ITEMID');
+});
+
+test('_parseAnchor + _driveBaseFor: qualified vs bare; cross-drive is not own-drive', () => {
+  const a = makeAdapter();
+  assert.deepEqual(a._parseAnchor('id:01ITEMID/x/y.md'), { driveId: null, id: '01ITEMID', rel: 'x/y.md' });
+  assert.deepEqual(a._parseAnchor('id:bDRV:01ITEMID/x/y.md'), { driveId: 'bDRV', id: '01ITEMID', rel: 'x/y.md' });
+  assert.equal(a._driveBaseFor('id:01ITEMID'), '/me/drive');
+  assert.equal(a._driveBaseFor('id:bDRV:01ITEMID'), '/drives/bDRV');
+  assert.equal(a._isOwnDrive('id:01ITEMID'), true);          // bare = own drive
+  assert.equal(a._isOwnDrive('id:bDRV:01ITEMID'), false);    // cross-drive = not own drive
+});
+
 test('_driveBase: falls back from site+drive to drive to /me/drive', () => {
   assert.equal(makeAdapter({ site_id: 'S', drive_id: 'D' })._driveBase(), '/sites/S/drives/D');
   assert.equal(makeAdapter({ drive_id: 'D' })._driveBase(), '/drives/D');

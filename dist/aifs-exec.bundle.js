@@ -38073,11 +38073,15 @@ var OneDriveAdapter = class {
     const addr = this._addr(path);
     try {
       const res = await this._graph(
-        `${addr.meta}?$select=id,size,lastModifiedDateTime,createdDateTime,cTag,eTag,folder,file`
+        `${addr.meta}?$select=id,size,lastModifiedDateTime,createdDateTime,cTag,eTag,folder,file,parentReference`
       );
       const data = await res.json();
       return {
         id: data.id,
+        // The item's home drive ID. Pointer-writers capture this so the discovery
+        // pointer can carry a fully-qualified cross-drive reference (id:{drive_id}:{id}),
+        // letting another member open content shared from this drive (C.1.3 crossdriveread).
+        drive_id: data.parentReference?.driveId || null,
         size: data.size || 0,
         modified: data.lastModifiedDateTime,
         created: data.createdDateTime,
@@ -38576,10 +38580,14 @@ var OneDriveAdapter = class {
     return lastItem || {};
   }
   // ─── Provisioning guard ──────────────────────────────────────────────
-  /** True when the path targets the member's OWN OneDrive (id-anchor, or a
-   *  config with no site/drive so the default drive is /me/drive). */
+  /** True when the path targets the member's OWN OneDrive (a bare id-anchor, or a
+   *  config with no site/drive so the default drive is /me/drive). A cross-drive
+   *  anchor (id:{driveId}:{itemId}) targets ANOTHER member's drive, so it is not
+   *  own-drive and must not be gated on the caller's own-drive provisioning. */
   _isOwnDrive(path) {
-    return this._isAnchor(path) || !this.connection.site_id && !this.connection.drive_id;
+    if (this._isAnchor(path))
+      return !this._parseAnchor(path).driveId;
+    return !this.connection.site_id && !this.connection.drive_id;
   }
   /** Guard own-drive access: a member's OneDrive provisions lazily (first
    *  office.com sign-in). Surface a clear NOT_PROVISIONED instead of a
@@ -38673,12 +38681,36 @@ var OneDriveAdapter = class {
       return `/drives/${this.connection.drive_id}`;
     return "/me/drive";
   }
-  /** Drive base for a given logical path: id-anchors live in the member's own OneDrive. */
+  /** Drive base for a given logical path: id-anchors live in the member's own OneDrive
+   *  (or, for a cross-drive anchor `id:{driveId}:{itemId}`, in the owner's drive). */
   _driveBaseFor(path) {
-    return this._isAnchor(path) ? "/me/drive" : this._driveBase();
+    if (!this._isAnchor(path))
+      return this._driveBase();
+    const { driveId } = this._parseAnchor(path);
+    return driveId ? `/drives/${driveId}` : "/me/drive";
   }
   _isAnchor(path) {
     return typeof path === "string" && path.startsWith("id:");
+  }
+  /**
+   * Parse an id-anchor into { driveId, id, rel }.
+   *   id:{itemId}[/rel]            → { driveId: null, id, rel }  (member's own /me/drive)
+   *   id:{driveId}:{itemId}[/rel]  → { driveId, id, rel }        (cross-drive — an item
+   *                                   shared from another member's OneDrive; C.1.3 crossdriveread)
+   * Drive IDs and item IDs contain no ':' or '/', so the first ':' after `id:`
+   * disambiguates the qualified (cross-drive) form from the bare (own-drive) form.
+   */
+  _parseAnchor(path) {
+    const body = path.slice(3);
+    const slash = body.indexOf("/");
+    const head = slash === -1 ? body : body.slice(0, slash);
+    const relRaw = slash === -1 ? "" : body.slice(slash + 1);
+    const rel = relRaw ? this._normalizePath("/" + relRaw).slice(1) : "";
+    const colon = head.indexOf(":");
+    if (colon !== -1) {
+      return { driveId: head.slice(0, colon), id: head.slice(colon + 1), rel };
+    }
+    return { driveId: null, id: head, rel };
   }
   /**
    * Build the Graph addresses for a logical path:
@@ -38686,10 +38718,8 @@ var OneDriveAdapter = class {
    */
   _addr(path) {
     if (this._isAnchor(path)) {
-      const m = /^id:([^/]+)(?:\/(.*))?$/.exec(path);
-      const id = m[1];
-      const rel = m[2] ? this._normalizePath("/" + m[2]).slice(1) : "";
-      const base = "/me/drive";
+      const { driveId, id, rel } = this._parseAnchor(path);
+      const base = driveId ? `/drives/${driveId}` : "/me/drive";
       if (!rel) {
         return { meta: `${base}/items/${id}`, child: `${base}/items/${id}/children`, content: `${base}/items/${id}/content` };
       }
