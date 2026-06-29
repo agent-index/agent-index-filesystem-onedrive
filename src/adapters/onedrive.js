@@ -544,7 +544,7 @@ export class OneDriveAdapter {
     const addr = this._addr(path);
     try {
       const res = await this._graph(
-        `${addr.meta}?$select=id,size,lastModifiedDateTime,createdDateTime,cTag,eTag,folder,file,parentReference`
+        `${addr.meta}?$select=id,size,lastModifiedDateTime,createdDateTime,cTag,eTag,folder,file,parentReference,webUrl`
       );
       const data = await res.json();
       return {
@@ -553,6 +553,10 @@ export class OneDriveAdapter {
         // pointer can carry a fully-qualified cross-drive reference (id:{drive_id}:{id}),
         // letting another member open content shared from this drive (C.1.3 crossdriveread).
         drive_id: data.parentReference?.driveId || null,
+        // Browser-openable URL for the item (Graph webUrl). Lets invite-member put a real
+        // clickable link to the bootstrap zip in the welcome email instead of a bare aifs
+        // path (C.1.3.3 bootstraplinkunavailable). May be absent for some item types.
+        web_url: data.webUrl || null,
         size: data.size || 0,
         modified: data.lastModifiedDateTime,
         created: data.createdDateTime,
