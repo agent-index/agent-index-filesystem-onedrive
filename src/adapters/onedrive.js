@@ -450,6 +450,46 @@ export class OneDriveAdapter {
         );
       }
 
+      // Durable committed-size read-back (M2, collectionjson-tornwrite, C.1.3.4 — HIGH).
+      // The check above trusts item.size from the PUT/upload RESPONSE (write-time
+      // metadata) — but a OneDrive simple-PUT can report a full/expected size while
+      // durably committing a TRUNCATED object, and item.size can be absent entirely.
+      // So independently re-read the COMMITTED size from a fresh metadata GET and
+      // compare to what we sent. This catches torn/partial commits for ALL content,
+      // including non-sentinel JSON: ms_install_10's core collection.json shipped at
+      // 31030/32402 bytes and slipped past the response-size check (no sentinel, so
+      // the tail re-read below never fired). Cheap — a $select=size metadata GET, no
+      // content download. Reads are best-effort (transient errors ride the backoff;
+      // a read we genuinely cannot complete returns null = "cannot confirm", never a
+      // false failure). On a confirmed mismatch, re-write once (the observed
+      // torn-write was transient) then fail loud.
+      const committedSize = async () => {
+        for (let i = 0; ; i++) {
+          try {
+            const mRes = await this._graph(`${addr.meta}?$select=size`);
+            const m = await mRes.json();
+            return (m && typeof m.size === 'number') ? m.size : null;
+          } catch (e) {
+            if (i >= READ_RETRY_BACKOFF_MS.length) return null;
+            await aifsSleep(READ_RETRY_BACKOFF_MS[i]);
+          }
+        }
+      };
+      let durableSize = await committedSize();
+      if (durableSize !== null && durableSize !== payload.length) {
+        item = await doWrite();
+        durableSize = await committedSize();
+        if (durableSize !== null && durableSize !== payload.length) {
+          throw new AifsError(
+            'AIFS_WRITE_VERIFY_FAILED',
+            `write: sent ${payload.length} bytes to "${path}" but the backend's committed copy is ${durableSize} bytes ` +
+            `(re-read from a fresh metadata GET after one retry) — the upload was truncated or partial; ` +
+            `do not trust the remote copy, re-write from source.`,
+            { path, expected_bytes: payload.length, actual_bytes: durableSize, verify: 'durable-readback' }
+          );
+        }
+      }
+
       if (sentinelKind) {
         const verifyOnce = async () => {
           const vRes = await this._graph(addr.content, { rawResponse: true });

@@ -37971,6 +37971,31 @@ var OneDriveAdapter = class {
           { path, expected_bytes: payload.length, actual_bytes: item.size }
         );
       }
+      const committedSize = async () => {
+        for (let i = 0; ; i++) {
+          try {
+            const mRes = await this._graph(`${addr.meta}?$select=size`);
+            const m = await mRes.json();
+            return m && typeof m.size === "number" ? m.size : null;
+          } catch (e) {
+            if (i >= READ_RETRY_BACKOFF_MS.length)
+              return null;
+            await aifsSleep(READ_RETRY_BACKOFF_MS[i]);
+          }
+        }
+      };
+      let durableSize = await committedSize();
+      if (durableSize !== null && durableSize !== payload.length) {
+        item = await doWrite();
+        durableSize = await committedSize();
+        if (durableSize !== null && durableSize !== payload.length) {
+          throw new AifsError(
+            "AIFS_WRITE_VERIFY_FAILED",
+            `write: sent ${payload.length} bytes to "${path}" but the backend's committed copy is ${durableSize} bytes (re-read from a fresh metadata GET after one retry) \u2014 the upload was truncated or partial; do not trust the remote copy, re-write from source.`,
+            { path, expected_bytes: payload.length, actual_bytes: durableSize, verify: "durable-readback" }
+          );
+        }
+      }
       if (sentinelKind) {
         const verifyOnce = async () => {
           const vRes = await this._graph(addr.content, { rawResponse: true });
