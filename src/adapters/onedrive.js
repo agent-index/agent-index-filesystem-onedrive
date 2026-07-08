@@ -521,6 +521,58 @@ export class OneDriveAdapter {
     }
   }
 
+  /**
+   * writeBatch — upload many files in a SINGLE process (bug bulkuploadserial).
+   * Parity with the gdrive adapter. OneDrive/Graph does not permit duplicate-
+   * named siblings (so the gdrive duplicate-parent-folder race doesn't apply
+   * here), but we still pre-ensure the unique parent set once via _ensureDir
+   * and then write each file — one process, per-file integrity verify, best-
+   * effort (a single file's failure doesn't abort the batch).
+   */
+  async writeBatch(entries, options = {}) {
+    await this._ensureAuth();
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new AifsError('INVALID_ARGS', 'writeBatch: entries must be a non-empty array of {path, content}', { count: Array.isArray(entries) ? entries.length : 0 });
+    }
+    const uniqueParents = [...new Set(entries.map(e => this._parentPath(e.path)))];
+    for (const parent of uniqueParents) {
+      await this._ensureDir(parent);
+    }
+    const results = [];
+    for (const entry of entries) {
+      try {
+        const r = await this.write(entry.path, entry.content, { ...options, ...(entry.options || {}) });
+        results.push({ path: entry.path, success: true, revision: r?.revision ?? null });
+      } catch (err) {
+        results.push({ path: entry.path, success: false, error: { code: err.code || 'AIFS_WRITE_FAILED', message: err.message } });
+      }
+    }
+    const failed = results.filter(r => !r.success).length;
+    return { total: results.length, succeeded: results.length - failed, failed, results };
+  }
+
+  /**
+   * statBatch — metadata for many paths in a SINGLE process (bug bulkuploadserial).
+   * Makes the publish-updates Step 0 diff feasible without N Node spawns.
+   */
+  async statBatch(paths) {
+    await this._ensureAuth();
+    if (!Array.isArray(paths) || paths.length === 0) {
+      throw new AifsError('INVALID_ARGS', 'statBatch: paths must be a non-empty array', {});
+    }
+    const results = [];
+    for (const p of paths) {
+      try {
+        const s = await this.stat(p);
+        results.push({ path: p, exists: true, id: s.id, size: s.size, mimeType: s.is_dir ? 'folder' : null, revision: s.revision });
+      } catch (err) {
+        if (err instanceof FileNotFoundError || err.status === 404) { results.push({ path: p, exists: false }); continue; }
+        results.push({ path: p, success: false, error: { code: err.code || 'AIFS_STAT_FAILED', message: err.message } });
+      }
+    }
+    return { total: results.length, results };
+  }
+
   async list(path, recursive = false) {
     await this._ensureAuth();
     await this._guardOwnDrive(path);

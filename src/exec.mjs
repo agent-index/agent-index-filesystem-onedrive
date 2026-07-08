@@ -210,6 +210,42 @@ async function routeToolCall(adapter, toolName, args) {
       return adapter.transferOwnership(args.path, args.new_owner);
     }
 
+    // ─── Batch ops (bulkuploadserial) — many files in ONE process ──────
+    case 'aifs_write_batch': {
+      requireArgs(toolName, args, ['entries']);
+      if (!Array.isArray(args.entries) || args.entries.length === 0) {
+        throw new AifsError('INVALID_ARGS', `${toolName}: 'entries' must be a non-empty array of {path, content|content_file}`, { tool: toolName });
+      }
+      const resolved = [];
+      for (let i = 0; i < args.entries.length; i++) {
+        const e = args.entries[i];
+        if (!e || typeof e.path !== 'string' || e.path === '') {
+          throw new AifsError('INVALID_ARGS', `${toolName}: entries[${i}] is missing a 'path'`, { tool: toolName, index: i });
+        }
+        let content = e.content;
+        if (content === undefined || content === null) {
+          if (typeof e.content_file === 'string' && e.content_file.length > 0) {
+            const payload = await readFile(e.content_file);
+            content = e.encoding === 'base64' ? payload.toString('base64') : payload.toString('utf-8');
+          } else {
+            throw new AifsError('INVALID_ARGS', `${toolName}: entries[${i}] ('${e.path}') has neither 'content' nor 'content_file'`, { tool: toolName, index: i });
+          }
+        }
+        if (e.encoding === 'base64' && !content.startsWith('base64:')) content = 'base64:' + content;
+        resolved.push({ path: e.path.replace(/\\/g, '/'), content });
+      }
+      return adapter.writeBatch(resolved);
+    }
+
+    case 'aifs_stat_batch': {
+      requireArgs(toolName, args, ['paths']);
+      if (!Array.isArray(args.paths) || args.paths.length === 0) {
+        throw new AifsError('INVALID_ARGS', `${toolName}: 'paths' must be a non-empty array`, { tool: toolName });
+      }
+      const paths = args.paths.map(p => (typeof p === 'string' ? p.replace(/\\/g, '/') : p));
+      return adapter.statBatch(paths);
+    }
+
     default:
       throw new AifsError('UNKNOWN_TOOL', `Unknown tool: ${toolName}`, { tool: toolName });
   }
@@ -225,7 +261,8 @@ async function main() {
       tools: ['aifs_read', 'aifs_write', 'aifs_list', 'aifs_exists', 'aifs_stat',
         'aifs_delete', 'aifs_copy', 'aifs_auth_status', 'aifs_authenticate', 'aifs_resolve_site',
         'aifs_resolve_identity', 'aifs_share', 'aifs_unshare', 'aifs_get_permissions',
-        'aifs_search', 'aifs_transfer_ownership'],
+        'aifs_search', 'aifs_transfer_ownership',
+        'aifs_write_batch', 'aifs_stat_batch'],
     }, null, 2));
     process.exit(0);
   }
