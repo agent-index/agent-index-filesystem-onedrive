@@ -1,6 +1,6 @@
 {
   "name": "@agent-index/filesystem-onedrive",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "Agent Index Filesystem — Microsoft OneDrive/SharePoint adapter (on-demand executor)",
   "type": "module",
   "main": "src/exec.mjs",
