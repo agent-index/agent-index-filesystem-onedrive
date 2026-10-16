@@ -24,18 +24,25 @@ import {
  * refused by the tenant/site external-sharing policy (finding 72). Distinct
  * from INVALID_SUBJECT: the address is a valid identity, the org just doesn't
  * allow sharing outside the organization. `reason` carries Graph's own message.
+ * `policy_inferred: true` (finding 84) when Graph gave only a generic refusal
+ * (sharingFailed / "problem sharing") with no policy wording — the policy is
+ * the likely cause, not a certain one, so callers word it as "usually".
  */
 export class ExternalShareBlockedError extends AifsError {
-  constructor(subject, path, graph = {}) {
+  constructor(subject, path, graph = {}, opts = {}) {
+    const inferred = opts.policyInferred === true;
     super(
       'EXTERNAL_SHARE_BLOCKED',
-      "Your organization's sharing settings don't allow sharing with people outside the organization",
+      inferred
+        ? "Microsoft refused to share with someone outside the organization — usually the tenant's external-sharing setting (SharePoint admin center → Policies → Sharing)"
+        : "Your organization's sharing settings don't allow sharing with people outside the organization",
       {
         path,
         subject,
         reason: graph.message || null,
         graph_status: graph.status ?? null,
         graph_code: graph.code || null,
+        policy_inferred: inferred,
       }
     );
   }
@@ -1157,7 +1164,10 @@ export class OneDriveAdapter {
       // item — that stays ACCESS_DENIED below unless Graph names a sharing policy.
       if (/notAllowed|sharingFailed/i.test(codes) ||
           policyWording.test(message) || /sharingFailed|problem sharing/i.test(message)) {
-        throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message });
+        // Finding 84: a generic sharingFailed / "problem sharing" with no policy
+        // wording (and no notAllowed code) is only *probably* the policy.
+        const policyInferred = !policyWording.test(message) && !/notAllowed/i.test(codes);
+        throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message }, { policyInferred });
       }
     } else if (policyWording.test(message) && /outside|external|guest/i.test(message)) {
       throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message });

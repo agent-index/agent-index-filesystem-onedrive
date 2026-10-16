@@ -37634,16 +37634,18 @@ import { dirname as dirname2, join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 var ExternalShareBlockedError = class extends AifsError {
-  constructor(subject, path, graph = {}) {
+  constructor(subject, path, graph = {}, opts = {}) {
+    const inferred = opts.policyInferred === true;
     super(
       "EXTERNAL_SHARE_BLOCKED",
-      "Your organization's sharing settings don't allow sharing with people outside the organization",
+      inferred ? "Microsoft refused to share with someone outside the organization \u2014 usually the tenant's external-sharing setting (SharePoint admin center \u2192 Policies \u2192 Sharing)" : "Your organization's sharing settings don't allow sharing with people outside the organization",
       {
         path,
         subject,
         reason: graph.message || null,
         graph_status: graph.status ?? null,
-        graph_code: graph.code || null
+        graph_code: graph.code || null,
+        policy_inferred: inferred
       }
     );
   }
@@ -38642,7 +38644,8 @@ var OneDriveAdapter = class {
     const policyWording = /shar(e|ing)[^.]*(disabled|not allowed|blocked|restricted|turned off)|external (user|sharing|recipient)|outside (of )?(your|the) organi[sz]ation|guest|notAllowed|ExternalSharing/i;
     if (ctx.external) {
       if (/notAllowed|sharingFailed/i.test(codes) || policyWording.test(message) || /sharingFailed|problem sharing/i.test(message)) {
-        throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message });
+        const policyInferred = !policyWording.test(message) && !/notAllowed/i.test(codes);
+        throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message }, { policyInferred });
       }
     } else if (policyWording.test(message) && /outside|external|guest/i.test(message)) {
       throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message });

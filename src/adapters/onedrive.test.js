@@ -390,6 +390,7 @@ test('share (finding 72): external blocked by policy -> EXTERNAL_SHARE_BLOCKED w
       assert.equal(resp.reason, graphMsg);
       assert.equal(resp.graph_status, 403);
       assert.equal(resp.graph_code, 'accessDenied');
+      assert.equal(resp.policy_inferred, false);
       return true;
     }
   );
@@ -400,6 +401,24 @@ test('share (finding 72): external + generic sharingFailed is NOT reported as an
   mockGraph(a, shareRoutes({ throw: { status: 400, code: 'invalidRequest', message: 'sharingFailed: There was a problem sharing.' } }));
   await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
     (err) => { assert.equal(err.code, 'EXTERNAL_SHARE_BLOCKED'); return true; });
+});
+
+test('share (finding 84): external + generic sharingFailed -> EXTERNAL_SHARE_BLOCKED with policy_inferred and Graph reason', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const graphMsg = 'There was a problem sharing, please try again later.';
+  mockGraph(a, shareRoutes({ throw: { status: 400, code: 'sharingFailed', message: graphMsg } }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
+    (err) => {
+      assert.equal(err.code, 'EXTERNAL_SHARE_BLOCKED');
+      assert.match(err.message, /usually the tenant's external-sharing setting/);
+      assert.doesNotMatch(err.message, /sharing settings don't allow/);
+      const resp = err.toResponse();
+      assert.equal(resp.policy_inferred, true);
+      assert.equal(resp.reason, graphMsg);
+      assert.equal(resp.graph_status, 400);
+      assert.equal(resp.graph_code, 'sharingFailed');
+      return true;
+    });
 });
 
 test('share (finding 72): tenant user that does not resolve -> INVALID_SUBJECT with Graph detail', async () => {
