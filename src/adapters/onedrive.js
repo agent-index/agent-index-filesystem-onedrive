@@ -19,6 +19,38 @@ import {
   InvalidScopeError,
 } from '@agent-index/filesystem/errors';
 
+/**
+ * EXTERNAL_SHARE_BLOCKED — a share with a recipient OUTSIDE the tenant was
+ * refused by the tenant/site external-sharing policy (finding 72). Distinct
+ * from INVALID_SUBJECT: the address is a valid identity, the org just doesn't
+ * allow sharing outside the organization. `reason` carries Graph's own message.
+ * `policy_inferred: true` (finding 84) when Graph gave only a generic refusal
+ * (sharingFailed / "problem sharing") with no policy wording — the policy is
+ * the likely cause, not a certain one, so callers word it as "usually".
+ */
+export class ExternalShareBlockedError extends AifsError {
+  constructor(subject, path, graph = {}, opts = {}) {
+    const inferred = opts.policyInferred === true;
+    super(
+      'EXTERNAL_SHARE_BLOCKED',
+      inferred
+        ? "Microsoft refused to share with someone outside the organization — usually the tenant's external-sharing setting (SharePoint admin center → Policies → Sharing)"
+        : "Your organization's sharing settings don't allow sharing with people outside the organization",
+      {
+        path,
+        subject,
+        reason: graph.message || null,
+        graph_status: graph.status ?? null,
+        graph_code: graph.code || null,
+        policy_inferred: inferred,
+      }
+    );
+  }
+}
+
+/** Basic syntactic email check (not deliverability — just "is this shaped like an address"). */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // ─── Platform-reliability helpers (parity with gdrive 2.6.0) ──────────
 
 export const AIFS_SENTINEL = 'AIFS:FILE-END';
@@ -88,8 +120,13 @@ function _extractAuthCode(input) {
  *     library (the configured site_id/drive_id), or the user's default drive.
  *   - `id:{itemId}/rel` ID anchors    -> the member's OWN OneDrive (`/me/drive`),
  *     for member-space addressing where the caller is granted but cannot
- *     enumerate from a root (standards section "Addressing"). Cross-drive
- *     shared-with-me anchors are an ACL fast-follow concern.
+ *     enumerate from a root (standards section "Addressing"). When the
+ *     connection has a configured drive (drive_id) and the item is NOT on
+ *     /me/drive (404), the bare anchor is retried once against the configured
+ *     site drive and pinned there for the process (finding 63) — so org items
+ *     addressed by bare id (org-config, collection dirs) still resolve. Never
+ *     the other way: absolute paths always stay on the configured drive.
+ *   - `id:{driveId}:{itemId}/rel`     -> that drive, no fallback (cross-drive).
  *
  * Connection config (agent-index.json -> remote_filesystem.connection):
  *   { "tenant_id", "client_id", "site_id"?, "drive_id"? }   — NO client_secret.
@@ -108,6 +145,10 @@ export class OneDriveAdapter {
     this._ownDriveOk = false; // cached: member's own OneDrive confirmed provisioned
     // path cache: normalized logical path -> { id, type, etag, ctag }
     this.pathCache = new Map();
+    // bare id-anchor itemId -> drive base it was found on ('/me/drive' or the
+    // configured drive base); filled by _resolveAnchorDrive (finding 63).
+    this._anchorBase = new Map();
+    this._tenantDomains = undefined; // cached verified tenant domains (finding 72)
   }
 
   async initialize(connection, credentialStore) {
@@ -827,6 +868,30 @@ export class OneDriveAdapter {
     return null;
   }
 
+  /**
+   * Turn a Graph `inheritedFrom` itemReference into an AIFS reference (finding 73):
+   * known cached path → logical path from `path` (".../root:/a/b", same drive) →
+   * drive-qualified anchor `id:{driveId}:{id}` → `onedrive-id:{id}` → null.
+   */
+  _inheritedFromRef(ref) {
+    if (!ref || typeof ref !== 'object') return null;
+    const { id, driveId } = ref;
+    const known = this._idToPath(id);
+    if (known) return known;
+    const configuredDrive = this.connection?.drive_id || null;
+    const sameDrive = !driveId || !configuredDrive || driveId === configuredDrive;
+    if (typeof ref.path === 'string' && sameDrive) {
+      const i = ref.path.indexOf('root:');
+      if (i !== -1) {
+        const rel = decodeURIComponent(ref.path.slice(i + 5));
+        return this._normalizePath(rel || '/');
+      }
+    }
+    if (id && driveId) return `id:${driveId}:${id}`;
+    if (id) return `onedrive-id:${id}`;
+    return null;
+  }
+
   /** Page through a Graph collection, returning all `value` entries. */
   async _graphCollect(firstUrl) {
     const out = [];
@@ -856,10 +921,18 @@ export class OneDriveAdapter {
         '[aifs] note: inherit:false is deprecated and ignored on onedrive — grant applied additively (parent inheritance unchanged).\n'
       );
     }
+    const isEmail = subject.includes('@');
+    if (isEmail && !EMAIL_RE.test(subject.trim())) {
+      throw new InvalidSubjectError(subject, 'malformed email address');
+    }
     const itemId = await this._resolveItemId(path);
     if (!itemId) throw new PathNotFoundError(path);
     const base = this._driveBaseFor(path);
-    const recipient = subject.includes('@') ? { email: subject } : { objectId: subject };
+    const recipient = isEmail ? { email: subject.trim() } : { objectId: subject };
+    // Finding 72: a recipient outside the tenant has no account to grant directly —
+    // Graph must send the sharing invitation so the guest can redeem it. Tenant users
+    // keep the silent grant (agent-index sends its own onboarding mail).
+    const external = isEmail ? await this._isExternalRecipient(subject.trim()) : false;
     let res;
     try {
       res = await this._graph(`${base}/items/${itemId}/invite`, {
@@ -869,15 +942,50 @@ export class OneDriveAdapter {
           recipients: [recipient],
           roles: graphRoles,
           requireSignIn: true,
-          sendInvitation: false, // agent-index sends its own onboarding mail
+          sendInvitation: external,
         }),
       });
     } catch (err) {
-      this._handlePermissionError(err, path, subject, role);
+      this._handlePermissionError(err, path, subject, role, { external });
     }
     const data = await res.json().catch(() => ({}));
     const permission_id = data?.value?.[0]?.id ?? null;
-    return { shared: true, permission_id, path, inherit_disabled: false };
+    return { shared: true, permission_id, path, inherit_disabled: false, external, invitation_sent: external };
+  }
+
+  /** Verified domains of the signed-in tenant (lower-case), or null if unreadable. Cached. */
+  async _tenantVerifiedDomains() {
+    if (this._tenantDomains !== undefined) return this._tenantDomains;
+    try {
+      const res = await this._graph('/organization?$select=verifiedDomains');
+      const data = await res.json();
+      const names = (data?.value || [])
+        .flatMap((o) => o?.verifiedDomains || [])
+        .map((d) => String(d?.name || '').toLowerCase())
+        .filter(Boolean);
+      this._tenantDomains = names.length ? names : null;
+    } catch {
+      this._tenantDomains = null;
+    }
+    return this._tenantDomains;
+  }
+
+  /**
+   * Is this email outside the tenant? Domain check against the tenant's verified
+   * domains first; if those can't be read, ask resolveIdentity — a genuine
+   * "no matching user" means external. Any other resolver failure (e.g. missing
+   * User.Read.All) is treated as internal, i.e. the pre-4.0.1 behaviour.
+   */
+  async _isExternalRecipient(email) {
+    const domain = String(email).split('@').pop().toLowerCase();
+    const domains = await this._tenantVerifiedDomains();
+    if (domains) return !domains.includes(domain);
+    try {
+      await this.resolveIdentity(email);
+      return false;
+    } catch (e) {
+      return e?.code === 'INVALID_SUBJECT';
+    }
   }
 
   /**
@@ -930,16 +1038,15 @@ export class OneDriveAdapter {
     for (const p of perms) {
       const inherited = !!p.inheritedFrom;
       if (!includeInherited && inherited) continue;
-      let inherited_from = null;
-      if (inherited) {
-        const src = p.inheritedFrom?.id;
-        inherited_from = this._idToPath(src) || (src ? `onedrive-id:${src}` : (p.inheritedFrom?.path || null));
-      }
       result.push({
         subject: this._permSubject(p),
         role: this._graphRolesToAifs(p.roles),
         permission_id: p.id || null,
-        inherited_from,
+        // Finding 73: populated from Graph's `inheritedFrom` itemReference when Graph
+        // reports it. OneDrive/SharePoint often OMITS inheritedFrom (e.g. access via
+        // site membership on a new folder) — then this stays null and inheritance
+        // simply isn't visible from this API; null does NOT prove a direct grant.
+        inherited_from: inherited ? this._inheritedFromRef(p.inheritedFrom) : null,
         granted_date: null, // Graph permission resource has no creation time
       });
     }
@@ -970,6 +1077,7 @@ export class OneDriveAdapter {
     const nameContains = query.nameContains || query.name_contains || null;
     const maxResults = Math.min(query.maxResults || query.max_results || 100, 1000);
 
+    await this._resolveAnchorDrive(scope); // finding 63 — before computing the base
     const base = this._driveBaseFor(scope);
     const norm = this._normalizePath(scope);
     const isRoot = !this._isAnchor(scope) && norm === '/';
@@ -1040,25 +1148,47 @@ export class OneDriveAdapter {
   }
 
   /** Map Graph permissions-API errors to typed AIFS errors (richer than file-op mapping). */
-  _handlePermissionError(err, path, subject, role) {
+  _handlePermissionError(err, path, subject, role, ctx = {}) {
+    if (err instanceof AifsError) throw err;
     const status = err.status || err.response?.status;
-    const message = err?.body?.error?.message || err?.message || '';
+    const gErr = err?.body?.error || {};
+    const message = gErr.message || err?.message || '';
+    const codes = [gErr.code, gErr.innerError?.code, gErr.innererror?.code].filter(Boolean).join('/');
+    const graphDetail = `Graph ${status ?? 'unknown'}${codes ? ` ${codes}` : ''}: ${message}`;
+    // Finding 72: a recipient outside the tenant is refused by the tenant/site
+    // external-sharing policy. That is NOT an invalid identity — never report a
+    // syntactically valid external email as "not a valid identity".
+    const policyWording = /shar(e|ing)[^.]*(disabled|not allowed|blocked|restricted|turned off)|external (user|sharing|recipient)|outside (of )?(your|the) organi[sz]ation|guest|notAllowed|ExternalSharing/i;
+    if (ctx.external) {
+      // A bare 403/accessDenied can also mean the caller lacks share rights on the
+      // item — that stays ACCESS_DENIED below unless Graph names a sharing policy.
+      if (/notAllowed|sharingFailed/i.test(codes) ||
+          policyWording.test(message) || /sharingFailed|problem sharing/i.test(message)) {
+        // Finding 84: a generic sharingFailed / "problem sharing" with no policy
+        // wording (and no notAllowed code) is only *probably* the policy.
+        const policyInferred = !policyWording.test(message) && !/notAllowed/i.test(codes);
+        throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message }, { policyInferred });
+      }
+    } else if (policyWording.test(message) && /outside|external|guest/i.test(message)) {
+      throw new ExternalShareBlockedError(subject, path, { status: status ?? null, code: codes || null, message });
+    }
     // identitymap diagnosability: Graph returns a generic "sharingFailed / please
-    // try again later" when the recipient doesn't resolve in the tenant — it
-    // LOOKS transient but isn't. Classify it as an unresolvable subject so the
-    // caller stops retrying and fixes the identity (bug 20260617-8d20ea22-identitymap).
-    if (/does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user|sharingFailed|problem sharing/i.test(message)) {
+    // try again later" when a TENANT recipient doesn't resolve — it LOOKS transient
+    // but isn't. Classify it as an unresolvable subject so the caller stops retrying
+    // and fixes the identity (bug 20260617-8d20ea22-identitymap). Only for tenant
+    // recipients (external ones are handled above).
+    if (!ctx.external && /does not exist|invalid.*recipient|invalid.*principal|could not be found|unknown.*user|sharingFailed|problem sharing/i.test(`${codes} ${message}`)) {
       throw new InvalidSubjectError(
         subject,
-        'could not be resolved to a grantable identity in this tenant — resolve the recipient (aifs_resolve_identity) and grant the resolved UPN/objectId, not the roster email'
+        `could not be resolved to a grantable identity in this tenant — resolve the recipient (aifs_resolve_identity) and grant the resolved UPN/objectId, not the roster email (${graphDetail})`
       );
     }
     switch (status) {
       case 401: throw new NotAuthenticatedError('expired');
-      case 403: throw new AccessDeniedError(path);
+      case 403: throw new AccessDeniedError(path, role ? 'share' : 'access permissions on', graphDetail);
       case 404: throw new PathNotFoundError(path);
       default:
-        throw new BackendError(`Microsoft Graph permissions error (${status ?? 'unknown'}): ${message}`, err);
+        throw new BackendError(`Microsoft Graph permissions error (${graphDetail})`, err);
     }
   }
 
@@ -1158,8 +1288,56 @@ export class OneDriveAdapter {
    *  anchor (id:{driveId}:{itemId}) targets ANOTHER member's drive, so it is not
    *  own-drive and must not be gated on the caller's own-drive provisioning. */
   _isOwnDrive(path) {
-    if (this._isAnchor(path)) return !this._parseAnchor(path).driveId;
+    if (this._isAnchor(path)) {
+      const { driveId, id } = this._parseAnchor(path);
+      if (driveId) return false;
+      // A bare anchor already found on the configured site drive (finding 63) is not own-drive.
+      const pinned = this._anchorBase.get(id);
+      return !(pinned && pinned !== '/me/drive');
+    }
     return (!this.connection.site_id && !this.connection.drive_id);
+  }
+
+  /** Configured (org) drive base, or null when the connection names no drive. */
+  _configuredDriveBase() {
+    return this.connection?.drive_id ? this._driveBase() : null;
+  }
+
+  /**
+   * Finding 63: a bare `id:{itemId}` anchor resolves against /me/drive by design,
+   * but org items addressed by bare id (org-config `id:{org_config_id}`, collection
+   * dirs `id:{folder_id}`) live in the configured SharePoint site drive. Probe the
+   * anchor item on /me/drive first; only if that is a 404/itemNotFound AND the
+   * connection has a configured drive, retry ONCE on the configured drive and pin
+   * the anchor there for this process. Never falls back the other way, and never
+   * touches absolute paths or drive-qualified anchors. Idempotent; best-effort
+   * (a non-404 probe error leaves the anchor on /me/drive, i.e. old behaviour).
+   */
+  async _resolveAnchorDrive(path) {
+    if (!this._isAnchor(path)) return;
+    const { driveId, id } = this._parseAnchor(path);
+    if (driveId || !id || this._anchorBase.has(id)) return;
+    // Drive-relative aliases (id:root, approot, special/...) always mean the caller's
+    // OWN drive; never re-point them, or an unprovisioned member's private space
+    // would be created in the org's site library (4.0.1 review).
+    if (/^(root|approot|special)\b/i.test(id)) return;
+    const configured = this._configuredDriveBase();
+    if (!configured || configured === '/me/drive') return;
+    const isNotFound = (e) =>
+      e?.status === 404 || /itemNotFound/i.test(e?.body?.error?.code || '');
+    let ownNotFound = false;
+    try {
+      const r = await this._graph(`/me/drive/items/${id}?$select=id`, { allowNotFound: true });
+      ownNotFound = r.status === 404;
+    } catch (e) {
+      if (!isNotFound(e)) return; // auth/throttle/etc: leave unresolved, op reports it
+      ownNotFound = true;
+    }
+    if (!ownNotFound) { this._anchorBase.set(id, '/me/drive'); return; }
+    try {
+      const r2 = await this._graph(`${configured}/items/${id}?$select=id`, { allowNotFound: true });
+      if (r2.status !== 404) this._anchorBase.set(id, configured);
+    } catch { /* not on the configured drive either — the op's own 404 stands */ }
   }
 
   /** Guard own-drive access: a member's OneDrive provisions lazily (first
@@ -1167,6 +1345,7 @@ export class OneDriveAdapter {
    *  misleading FILE_NOT_FOUND. Cached per process; configured SharePoint
    *  org-root paths skip it entirely. */
   async _guardOwnDrive(path) {
+    await this._resolveAnchorDrive(path); // finding 63 — before deciding own-drive
     if (!this._isOwnDrive(path) || this._ownDriveOk) return;
     const r = await this._graph('/me/drive?$select=id', { allowNotFound: true });
     if (r.status === 404) {
@@ -1252,8 +1431,9 @@ export class OneDriveAdapter {
    *  (or, for a cross-drive anchor `id:{driveId}:{itemId}`, in the owner's drive). */
   _driveBaseFor(path) {
     if (!this._isAnchor(path)) return this._driveBase();
-    const { driveId } = this._parseAnchor(path);
-    return driveId ? `/drives/${driveId}` : '/me/drive';
+    const { driveId, id } = this._parseAnchor(path);
+    if (driveId) return `/drives/${driveId}`;
+    return this._anchorBase.get(id) || '/me/drive'; // finding 63 pin, else own drive
   }
 
   _isAnchor(path) {
@@ -1287,9 +1467,10 @@ export class OneDriveAdapter {
    */
   _addr(path) {
     if (this._isAnchor(path)) {
-      const { driveId, id, rel } = this._parseAnchor(path);
-      // Cross-drive anchor routes to /drives/{driveId}; bare anchor to the member's own drive.
-      const base = driveId ? `/drives/${driveId}` : '/me/drive';
+      const { id, rel } = this._parseAnchor(path);
+      // Cross-drive anchor routes to /drives/{driveId}; bare anchor to the member's own
+      // drive, or to the configured drive if _resolveAnchorDrive pinned it there (finding 63).
+      const base = this._driveBaseFor(path);
       if (!rel) {
         return { meta: `${base}/items/${id}`, child: `${base}/items/${id}/children`, content: `${base}/items/${id}/content` };
       }
@@ -1306,6 +1487,7 @@ export class OneDriveAdapter {
   }
 
   async _statRaw(path) {
+    await this._resolveAnchorDrive(path);
     try {
       const res = await this._graph(`${this._addr(path).meta}?$select=id,parentReference,folder`, { allowNotFound: true });
       if (res.status === 404) return null;
@@ -1314,6 +1496,9 @@ export class OneDriveAdapter {
   }
 
   async _resolveItemId(path) {
+    // Resolve the anchor's drive first, even on a cache hit, so callers that then
+    // use _driveBaseFor(path) address the drive the item actually lives on (finding 63).
+    await this._resolveAnchorDrive(path);
     const cached = this.pathCache.get(this._normalizePath(path));
     if (cached?.id) return cached.id;
     const meta = await this._statRaw(path);

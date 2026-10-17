@@ -299,3 +299,246 @@ test('completeAuth without a persisted verifier fails clearly', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ─── 4.0.1 fix pass: findings 72 (external share), 73 (inherited_from), 63 (bare-id fallback) ──
+
+const AUTHED = { access_token: 't', expires_at: Date.now() + 3600_000 };
+
+/** Mock _graph: routes(url, opts) returns { status, body } or throws an err-shaped object. Records calls. */
+function mockGraph(a, routes) {
+  const calls = [];
+  a._graph = async (url, opts = {}) => {
+    calls.push({ url, opts });
+    const r = await routes(url, opts);
+    if (r?.throw) {
+      const e = new Error(r.throw.message || 'Graph API error');
+      e.status = r.throw.status;
+      e.body = { error: { code: r.throw.code, message: r.throw.message } };
+      throw e;
+    }
+    if (r.status === 404 && !opts.allowNotFound) {
+      const e = new Error('Not found'); e.status = 404;
+      e.body = { error: { code: 'itemNotFound', message: 'The resource could not be found.' } };
+      throw e;
+    }
+    return { status: r.status ?? 200, json: async () => r.body ?? {} };
+  };
+  return calls;
+}
+
+const ORG = { value: [{ verifiedDomains: [{ name: 'AgentIndex.onmicrosoft.com' }, { name: 'agent-index.ai' }] }] };
+
+function shareRoutes(inviteResult) {
+  return (url) => {
+    if (url.startsWith('/organization')) return { body: ORG };
+    if (url.includes('/invite')) return inviteResult;
+    if (url.includes('root:/shared/doc.md')) return { body: { id: 'ITEM1' } };
+    return { status: 404 };
+  };
+}
+
+test('share (finding 72): tenant user -> invite with sendInvitation:false', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, shareRoutes({ body: { value: [{ id: 'P1' }] } }));
+  const r = await a.share('/shared/doc.md', 'three@agent-index.ai', 'reader');
+  const invite = calls.find((c) => c.url.includes('/invite'));
+  const body = JSON.parse(invite.opts.body);
+  assert.equal(invite.url, '/sites/S/drives/D/items/ITEM1/invite');
+  assert.equal(body.sendInvitation, false);
+  assert.equal(body.requireSignIn, true);
+  assert.deepEqual(body.recipients, [{ email: 'three@agent-index.ai' }]);
+  assert.equal(r.external, false);
+  assert.equal(r.permission_id, 'P1');
+});
+
+test('share (finding 72): external email -> invite with sendInvitation:true', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, shareRoutes({ body: { value: [{ id: 'P2' }] } }));
+  const r = await a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader');
+  const body = JSON.parse(calls.find((c) => c.url.includes('/invite')).opts.body);
+  assert.equal(body.sendInvitation, true);
+  assert.equal(body.requireSignIn, true);
+  assert.equal(r.external, true);
+  assert.equal(r.invitation_sent, true);
+});
+
+test('share (finding 72): external email, domains unreadable, resolver finds no user -> external', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, (url) => {
+    if (url.startsWith('/organization')) return { throw: { status: 403, code: 'Authorization_RequestDenied', message: 'denied' } };
+    if (url.startsWith('/users/')) return { status: 404 };
+    if (url.startsWith('/users?')) return { body: { value: [] } };
+    return shareRoutes({ body: { value: [{ id: 'P3' }] } })(url);
+  });
+  await a.share('/shared/doc.md', 'someone@outside.example', 'reader');
+  const body = JSON.parse(calls.find((c) => c.url.includes('/invite')).opts.body);
+  assert.equal(body.sendInvitation, true);
+});
+
+test('share (finding 72): external blocked by policy -> EXTERNAL_SHARE_BLOCKED with Graph reason', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const graphMsg = 'Sharing with external users is not allowed by your organization.';
+  mockGraph(a, shareRoutes({ throw: { status: 403, code: 'accessDenied', message: graphMsg } }));
+  await assert.rejects(
+    () => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
+    (err) => {
+      assert.equal(err.code, 'EXTERNAL_SHARE_BLOCKED');
+      assert.match(err.message, /sharing settings don't allow sharing with people outside the organization/);
+      assert.doesNotMatch(err.message, /not a valid identity/i);
+      const resp = err.toResponse();
+      assert.equal(resp.error, 'EXTERNAL_SHARE_BLOCKED');
+      assert.equal(resp.reason, graphMsg);
+      assert.equal(resp.graph_status, 403);
+      assert.equal(resp.graph_code, 'accessDenied');
+      assert.equal(resp.policy_inferred, false);
+      return true;
+    }
+  );
+});
+
+test('share (finding 72): external + generic sharingFailed is NOT reported as an invalid identity', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  mockGraph(a, shareRoutes({ throw: { status: 400, code: 'invalidRequest', message: 'sharingFailed: There was a problem sharing.' } }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
+    (err) => { assert.equal(err.code, 'EXTERNAL_SHARE_BLOCKED'); return true; });
+});
+
+test('share (finding 84): external + generic sharingFailed -> EXTERNAL_SHARE_BLOCKED with policy_inferred and Graph reason', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const graphMsg = 'There was a problem sharing, please try again later.';
+  mockGraph(a, shareRoutes({ throw: { status: 400, code: 'sharingFailed', message: graphMsg } }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
+    (err) => {
+      assert.equal(err.code, 'EXTERNAL_SHARE_BLOCKED');
+      assert.match(err.message, /usually the tenant's external-sharing setting/);
+      assert.doesNotMatch(err.message, /sharing settings don't allow/);
+      const resp = err.toResponse();
+      assert.equal(resp.policy_inferred, true);
+      assert.equal(resp.reason, graphMsg);
+      assert.equal(resp.graph_status, 400);
+      assert.equal(resp.graph_code, 'sharingFailed');
+      return true;
+    });
+});
+
+test('share (finding 72): tenant user that does not resolve -> INVALID_SUBJECT with Graph detail', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  mockGraph(a, shareRoutes({ throw: { status: 400, code: 'invalidRequest', message: 'One or more users could not be found.' } }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'ghost@agent-index.ai', 'reader'),
+    (err) => {
+      assert.equal(err.code, 'INVALID_SUBJECT');
+      assert.match(err.details.reason, /Graph 400 invalidRequest: One or more users could not be found/);
+      return true;
+    });
+});
+
+test('share (finding 72): malformed email -> INVALID_SUBJECT before any Graph call', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, () => ({ status: 404 }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'not an@email', 'reader'),
+    (err) => { assert.equal(err.code, 'INVALID_SUBJECT'); assert.match(err.message, /malformed/); return true; });
+  assert.equal(calls.length, 0);
+});
+
+test('_handlePermissionError (finding 72): other errors keep BACKEND_ERROR but carry Graph status + code + message', () => {
+  const a = makeAdapter();
+  const err = { status: 500, body: { error: { code: 'generalException', message: 'Boom.' } } };
+  assert.throws(() => a._handlePermissionError(err, '/x', 'u@agent-index.ai', 'reader'),
+    (e) => { assert.equal(e.code, 'BACKEND_ERROR'); assert.match(e.message, /500 generalException: Boom\./); return true; });
+});
+
+test('getPermissions (finding 73): inherited_from populated from inheritedFrom; null when Graph omits it', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  a.pathCache.set('/shared', { id: 'PARENT', type: 'directory' });
+  mockGraph(a, (url) => {
+    if (url.includes('root:/shared/new')) return { body: { id: 'NEW', folder: {} } };
+    if (url.endsWith('/items/NEW/permissions')) return { body: { value: [
+      { id: 'p1', roles: ['write'], grantedToV2: { siteGroup: { loginName: 'Members' } }, inheritedFrom: { id: 'PARENT', driveId: 'D' } },
+      { id: 'p2', roles: ['read'], grantedToV2: { user: { email: 'x@e.com' } }, inheritedFrom: { driveId: 'D', path: '/drives/D/root:/shared/sub' } },
+      { id: 'p3', roles: ['read'], grantedToV2: { user: { email: 'y@e.com' } }, inheritedFrom: { driveId: 'OTHER', id: 'ZZ' } },
+      { id: 'p4', roles: ['read'], grantedToV2: { user: { email: 'z@e.com' } } },
+    ] } };
+    return { status: 404 };
+  });
+  const { permissions } = await a.getPermissions('/shared/new');
+  const by = Object.fromEntries(permissions.map((p) => [p.permission_id, p]));
+  assert.equal(by.p1.inherited_from, '/shared');
+  assert.equal(by.p2.inherited_from, '/shared/sub');
+  assert.equal(by.p3.inherited_from, 'id:OTHER:ZZ');
+  assert.equal(by.p4.inherited_from, null);
+  assert.equal(by.p1.role, 'writer');
+  assert.equal(by.p1.subject, 'Members');
+  const direct = await a.getPermissions('/shared/new', { includeInherited: false });
+  assert.deepEqual(direct.permissions.map((p) => p.permission_id), ['p4']);
+});
+
+test('bare id anchor (finding 63): found on /me/drive -> no retry, stays on /me/drive', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED; a._ownDriveOk = true;
+  const calls = mockGraph(a, (url) => {
+    if (url === '/me/drive/items/OWN?$select=id') return { body: { id: 'OWN' } };
+    if (url.startsWith('/me/drive/items/OWN')) return { body: { id: 'OWN', parentReference: { driveId: 'ME' }, size: 3 } };
+    return { status: 404 };
+  });
+  const s = await a.stat('id:OWN');
+  assert.equal(s.drive_id, 'ME');
+  assert.ok(calls.every((c) => c.url.startsWith('/me/drive')), 'never touched the site drive');
+  assert.equal(a._driveBaseFor('id:OWN'), '/me/drive');
+});
+
+test('bare id anchor (finding 63): 404 on /me/drive -> retried once on configured site drive', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, (url) => {
+    if (url.startsWith('/me/drive')) return { status: 404 };
+    if (url === '/sites/S/drives/D/items/ORGCFG?$select=id') return { body: { id: 'ORGCFG' } };
+    if (url.startsWith('/sites/S/drives/D/items/ORGCFG?')) return { body: { id: 'ORGCFG', parentReference: { driveId: 'D' }, size: 10 } };
+    if (url === '/sites/S/drives/D/items/ORGCFG/content') return { body: {} };
+    return { status: 404 };
+  });
+  const s = await a.stat('id:ORGCFG');
+  assert.equal(s.id, 'ORGCFG');
+  assert.equal(s.drive_id, 'D', 'drive_id is the drive it was actually found on');
+  assert.equal(a._driveBaseFor('id:ORGCFG/sub/x.md'), '/sites/S/drives/D');
+  assert.equal(a._isOwnDrive('id:ORGCFG'), false);
+  assert.equal(calls.filter((c) => c.url.startsWith('/me/drive/items/ORGCFG')).length, 1, 'one own-drive probe');
+  // later ops reuse the pin (no further probes) and address the site drive
+  const perms = mockGraph(a, (url) => (url === '/sites/S/drives/D/items/ORGCFG/permissions' ? { body: { value: [] } } : { status: 404 }));
+  a.pathCache.set('id:ORGCFG', { id: 'ORGCFG', type: 'file' });
+  await a.getPermissions('id:ORGCFG');
+  assert.equal(perms.length, 1);
+});
+
+test('bare id anchor (finding 63): no configured drive -> no fallback probe', async () => {
+  const a = makeAdapter({ tenant_id: 't', client_id: 'c' }); a.tokens = AUTHED;
+  const calls = mockGraph(a, () => ({ status: 404 }));
+  await a._resolveAnchorDrive('id:X');
+  assert.equal(calls.length, 0);
+  assert.equal(a._driveBaseFor('id:X'), '/me/drive');
+});
+
+test('drive-qualified anchor (finding 63): unchanged, no probes', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, () => ({ status: 404 }));
+  await a._resolveAnchorDrive('id:bDRV:01ITEM/doc.md');
+  assert.equal(calls.length, 0);
+  assert.equal(a._addr('id:bDRV:01ITEM/doc.md').meta, '/drives/bDRV/items/01ITEM:/doc.md');
+  // absolute paths never fall back to /me/drive
+  assert.equal(a._driveBaseFor('/shared/x.md'), '/sites/S/drives/D');
+});
+
+test('bare id anchor (finding 63, review): id:root never falls back to the site drive (unprovisioned own drive)', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  const calls = mockGraph(a, () => ({ status: 404 }));
+  await a._resolveAnchorDrive('id:root/Agent-Index-Private-x');
+  assert.equal(calls.length, 0, 'no probes for drive-relative aliases');
+  assert.equal(a._driveBaseFor('id:root/Agent-Index-Private-x'), '/me/drive');
+  assert.equal(a._isOwnDrive('id:root/Agent-Index-Private-x'), true, 'own-drive guard still applies');
+  await assert.rejects(() => a.exists('id:root/Agent-Index-Private-x'),
+    (err) => { assert.equal(err.code, 'NOT_PROVISIONED'); return true; });
+});
+
+test('share (finding 72, review): external + plain 403 accessDenied without policy wording -> ACCESS_DENIED, not EXTERNAL_SHARE_BLOCKED', async () => {
+  const a = makeAdapter(); a.tokens = AUTHED;
+  mockGraph(a, shareRoutes({ throw: { status: 403, code: 'accessDenied', message: 'Access denied.' } }));
+  await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
+    (err) => { assert.equal(err.code, 'ACCESS_DENIED'); return true; });
+});
