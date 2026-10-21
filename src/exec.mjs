@@ -14,6 +14,7 @@
 
 import { initEnvironment, loadConfig } from '@agent-index/filesystem';
 import { AifsError } from '@agent-index/filesystem/errors';
+import { argWarnings } from './arg-warnings.mjs';
 import { OneDriveAdapter } from './adapters/onedrive.js';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -277,6 +278,12 @@ async function main() {
     }
   }
   toolArgs = normalizePathArgs(toolArgs);
+
+  // CI-018 Phase 1: name ignored arguments on stderr (stdout stays the tool's
+  // output, byte-exact for aifs_read). The call still runs exactly as before.
+  for (const w of argWarnings(toolName, toolArgs)) {
+    process.stderr.write(`aifs-exec: warning: ${w}\n`);
+  }
 
   initEnvironment();
 
