@@ -542,3 +542,31 @@ test('share (finding 72, review): external + plain 403 accessDenied without poli
   await assert.rejects(() => a.share('/shared/doc.md', 'bilsalak@gmail.com', 'reader'),
     (err) => { assert.equal(err.code, 'ACCESS_DENIED'); return true; });
 });
+
+// CI-018 follow-up: aifs_get_permissions honours include_inherited.
+function permAdapter() {
+  const a = makeAdapter();
+  a._ensureAuth = async () => {};
+  a._resolveItemId = async () => 'ITEM';
+  a._graphCollect = async () => [
+    { id: 'p-direct', roles: ['read'], grantedToV2: { user: { email: 'direct@example.com' } } },
+    { id: 'p-inherited', roles: ['write'], grantedToV2: { user: { email: 'folder@example.com' } }, inheritedFrom: { id: 'PARENT', path: '/drive/root:/Parent' } },
+  ];
+  return a;
+}
+
+test('getPermissions: includeInherited false returns only grants on the item itself', async () => {
+  const ids = async (opts) => (await permAdapter().getPermissions('/x', opts)).permissions.map((p) => p.permission_id);
+  assert.deepEqual(await ids({ includeInherited: false }), ['p-direct']);
+  assert.deepEqual(await ids({ includeInherited: true }), ['p-direct', 'p-inherited']);
+  assert.deepEqual(await ids({}), ['p-direct', 'p-inherited'], 'default stays "include inherited"');
+});
+
+test('exec: aifs_get_permissions passes include_inherited through to getPermissions', async () => {
+  const src = await readFile(new URL('../exec.mjs', import.meta.url), 'utf8');
+  const start = src.indexOf("case 'aifs_get_permissions'");
+  const block = src.slice(start, src.indexOf('case ', start + 10));
+  assert.match(block, /hasOwnProperty\.call\(args,\s*'include_inherited'\)/);
+  assert.match(block, /options\.includeInherited\s*=\s*args\.include_inherited/);
+  assert.match(block, /getPermissions\(args\.path,\s*options\)/);
+});

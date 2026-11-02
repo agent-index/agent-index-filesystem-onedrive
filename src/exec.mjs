@@ -200,7 +200,12 @@ async function routeToolCall(adapter, toolName, args) {
     }
     case 'aifs_get_permissions': {
       requireArgs(toolName, args, [['path', 'path']]);
-      return adapter.getPermissions(args.path, {});
+      // include_inherited (SPEC, default true): false = only grants made on this exact item.
+      const options = {};
+      if (Object.prototype.hasOwnProperty.call(args, 'include_inherited')) {
+        options.includeInherited = args.include_inherited;
+      }
+      return adapter.getPermissions(args.path, options);
     }
     case 'aifs_search': {
       requireArgs(toolName, args, ['scope']);
@@ -280,7 +285,7 @@ async function main() {
         aifs_resolve_identity: '{ref} (aliases: email, subject, identity, upn, user, member, recipient)',
         aifs_share: '{path, subject, role}',
         aifs_unshare: '{path, subject}',
-        aifs_get_permissions: '{path}',
+        aifs_get_permissions: '{path, include_inherited?}',
         aifs_search: '{scope, name_contains?, type?: "file"|"folder"|"any", max_results?}',
         aifs_transfer_ownership: '{path, new_owner} (not implemented on OneDrive)',
         aifs_write_batch: '{entries: [{path, content | content_file, encoding?}]}',
