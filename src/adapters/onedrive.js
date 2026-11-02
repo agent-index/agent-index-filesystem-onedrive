@@ -381,6 +381,24 @@ export class OneDriveAdapter {
     };
   }
 
+  // ─── Org path seeding (CI-025, 2.8.0) ───────────────────────────────
+
+  /**
+   * Seed from the org map (shared library org-map.js). Plain paths already
+   * resolve on OneDrive, so paths are left alone. The org's own item ids are
+   * registered on the configured site drive, so a bare `id:{item}` for an org
+   * item resolves there directly instead of probing the member's own drive
+   * first (finding 63; technical design §2.6).
+   */
+  seedOrgPrefixes(prefixes) {
+    if (!prefixes || typeof prefixes !== 'object') return;
+    const configured = this._configuredDriveBase();
+    if (!configured || configured === '/me/drive') return;
+    for (const entry of Object.values(prefixes)) {
+      if (entry && entry.id && !this._anchorBase.has(entry.id)) this._anchorBase.set(entry.id, configured);
+    }
+  }
+
   // ─── File operations ─────────────────────────────────────────────────
 
   async read(path) {
@@ -415,6 +433,37 @@ export class OneDriveAdapter {
               `read: backend returned empty content for "${path}" but metadata reports ${declaredSize} bytes ` +
               `(retried ${READ_RETRY_BACKOFF_MS.length}x). Transient backend failure — retry; do NOT treat as empty.`,
               { path, declared_size: declaredSize, retries: READ_RETRY_BACKOFF_MS.length }
+            );
+          }
+        }
+      }
+
+      // CI-025 (2.8.0): size check on non-empty reads (parity with gdrive's 2.11.6
+      // read check, size only). A short body is re-read with backoff, then fails
+      // AIFS_READ_UNRELIABLE (reason size_mismatch). A failed metadata call skips
+      // the check; it never fails a read that succeeded.
+      if (buffer.length > 0) {
+        const metaSize = async () => {
+          try {
+            const r = await this._graph(`${addr.meta}?$select=size`);
+            const n = (await r.json())?.size;
+            return typeof n === 'number' ? n : null;
+          } catch { return null; }
+        };
+        let declared = await metaSize();
+        if (declared !== null && declared !== buffer.length) {
+          for (const delay of READ_RETRY_BACKOFF_MS) {
+            await aifsSleep(delay);
+            buffer = await fetchBuffer();
+            declared = await metaSize();
+            if (declared === null || declared === buffer.length) break;
+          }
+          if (declared !== null && declared !== buffer.length) {
+            throw new AifsError(
+              'AIFS_READ_UNRELIABLE',
+              `read: content returned for "${path}" doesn't match the file's current size (got ${buffer.length} bytes, ` +
+              `metadata reports ${declared}; retried ${READ_RETRY_BACKOFF_MS.length}x). Stale or incomplete read — retry; do NOT use this content.`,
+              { path, reason: 'size_mismatch', declared_size: declared, received_size: buffer.length, retries: READ_RETRY_BACKOFF_MS.length }
             );
           }
         }
@@ -1120,7 +1169,17 @@ export class OneDriveAdapter {
       let p = this._idToPath(f.id);
       if (!p) {
         const baseScope = isRoot ? '' : norm.replace(/\/$/, '');
-        p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        // CI-025: a name search is recursive, so a hit may sit below the scope.
+        // For a plain scope, use the item's parent path (parentReference.path,
+        // "/drive/root:/a/b" or "/drives/{id}/root:/a/b") when Graph returns it.
+        const parentPath = typeof f.parentReference?.path === 'string'
+          ? (() => { try { return decodeURIComponent(f.parentReference.path.replace(/^.*?root:/, '')); } catch { return null; } })()
+          : null;
+        if (!this._isAnchor(scope) && parentPath !== null && (parentPath === '' || parentPath.startsWith('/'))) {
+          p = `${parentPath.replace(/\/$/, '')}/${f.name}`;
+        } else {
+          p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        }
       }
       results.push({
         path: p,
