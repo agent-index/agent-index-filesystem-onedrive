@@ -281,9 +281,12 @@ async function main() {
 
   // CI-018 Phase 1: name ignored arguments on stderr (stdout stays the tool's
   // output, byte-exact for aifs_read). The call still runs exactly as before.
-  for (const w of argWarnings(toolName, toolArgs)) {
-    process.stderr.write(`aifs-exec: warning: ${w}\n`);
-  }
+  // A warning must never break a call: if building or printing one fails, the call runs anyway.
+  try {
+    for (const w of argWarnings(toolName, toolArgs)) {
+      process.stderr.write(`aifs-exec: warning: ${w}\n`);
+    }
+  } catch { /* warnings are best-effort */ }
 
   initEnvironment();
 
