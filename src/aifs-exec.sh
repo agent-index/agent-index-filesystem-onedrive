@@ -73,7 +73,7 @@ ignored without an error, so a misspelled name silently does nothing.
   aifs_unshare             Remove access from a path
                              {path, subject}
   aifs_get_permissions     List permissions on a path
-                             {path}
+                             {path, include_inherited?}
   aifs_search              Find files and folders by name
                              {scope, name_contains?, type?: "file" | "folder" | "any", max_results?}
   aifs_transfer_ownership  Not implemented on OneDrive (returns NOT_IMPLEMENTED)
