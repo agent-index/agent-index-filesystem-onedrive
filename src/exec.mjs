@@ -177,7 +177,8 @@ async function routeToolCall(adapter, toolName, args) {
 
     // Resolve a member reference (email/UPN/objectId) to the tenant's grantable
     // identity {id, upn, mail}. Used by invite-member to persist sharing_identity
-    // (identitymap). On gdrive the analog is a passthrough.
+    // (identitymap). gdrive has no such tool (it returns UNKNOWN_TOOL): there the
+    // member's email is the grantable identity, so callers use it as is.
     case 'aifs_resolve_identity': {
       // Accept the common aliases callers reach for (email/subject/identity/upn/…)
       // rather than requiring exactly `ref` — requiring the one exact key cost a
@@ -200,7 +201,12 @@ async function routeToolCall(adapter, toolName, args) {
     }
     case 'aifs_get_permissions': {
       requireArgs(toolName, args, [['path', 'path']]);
-      return adapter.getPermissions(args.path, {});
+      // include_inherited (SPEC, default true): false = only grants made on this exact item.
+      const options = {};
+      if (Object.prototype.hasOwnProperty.call(args, 'include_inherited')) {
+        options.includeInherited = args.include_inherited;
+      }
+      return adapter.getPermissions(args.path, options);
     }
     case 'aifs_search': {
       requireArgs(toolName, args, ['scope']);
@@ -264,6 +270,34 @@ async function main() {
         'aifs_resolve_identity', 'aifs_share', 'aifs_unshare', 'aifs_get_permissions',
         'aifs_search', 'aifs_transfer_ownership',
         'aifs_write_batch', 'aifs_stat_batch'],
+      // Argument signatures, kept in step with routeToolCall above.
+      // "?" = optional. Unknown arguments are ignored without an error.
+      arguments: {
+        aifs_read: '{path}',
+        aifs_write: '{path, content | content_file | content_stdin, encoding?, if_revision?}',
+        aifs_list: '{path, recursive?}',
+        aifs_exists: '{path}',
+        aifs_stat: '{path}',
+        aifs_delete: '{path}',
+        aifs_copy: '{source, destination}',
+        aifs_auth_status: '{}',
+        aifs_authenticate: '{action?: "start"|"complete", auth_code?}',
+        aifs_resolve_site: '{site_url}',
+        aifs_resolve_identity: '{ref} (aliases: email, subject, identity, upn, user, member, recipient)',
+        aifs_share: '{path, subject, role}',
+        aifs_unshare: '{path, subject}',
+        aifs_get_permissions: '{path, include_inherited?}',
+        aifs_search: '{scope, name_contains?, type?: "file"|"folder"|"any", max_results?}',
+        aifs_transfer_ownership: '{path, new_owner} (not implemented on OneDrive)',
+        aifs_write_batch: '{entries: [{path, content | content_file, encoding?}]}',
+        aifs_stat_batch: '{paths: [...]}',
+      },
+      notes: [
+        'aifs_write: give exactly one of content, content_file, content_stdin. Inline content is bounded by the OS argument limit (~128 KiB); content_file and content_stdin have no size limit. If more than one is given, content wins, then content_file, then content_stdin.',
+        'encoding "base64": a content_file/content_stdin payload is taken as raw bytes (use for binary files; otherwise it is read as UTF-8). An inline content string must itself be base64.',
+        'if_revision: revision from aifs_stat; the write fails with REVISION_CONFLICT if the file has changed since.',
+        'Paths: absolute paths address the org SharePoint library; id:{item_id} is your own OneDrive (retried once on the site library if not found); id:{drive_id}:{item_id} is that drive. aifs_search scope takes a path or an id: anchor.',
+      ],
     }, null, 2));
     process.exit(0);
   }
