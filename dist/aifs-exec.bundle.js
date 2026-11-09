@@ -37628,6 +37628,75 @@ var NotProvisionedError = class extends AifsError {
   }
 };
 
+// src/arg-warnings.mjs
+var TOOL_ARGS = Object.freeze({
+  aifs_read: ["path", "encoding"],
+  aifs_write: ["path", "content", "content_file", "content_stdin", "encoding", "if_revision"],
+  aifs_list: ["path", "recursive"],
+  aifs_exists: ["path"],
+  aifs_stat: ["path"],
+  aifs_delete: ["path"],
+  aifs_copy: ["source", "destination"],
+  aifs_auth_status: [],
+  aifs_authenticate: ["action", "auth_code"],
+  aifs_resolve_site: ["site_url"],
+  // ref, plus the aliases routeToolCall coalesces into it
+  aifs_resolve_identity: ["ref", "email", "subject", "identity", "upn", "user", "member", "recipient"],
+  aifs_share: ["path", "subject", "role", "inherit"],
+  aifs_unshare: ["path", "subject"],
+  aifs_get_permissions: ["path", "include_inherited"],
+  aifs_search: ["scope", "name_contains", "type", "max_results"],
+  aifs_transfer_ownership: ["path", "new_owner"],
+  aifs_write_batch: ["entries"],
+  aifs_stat_batch: ["paths"]
+});
+var CONTRACT_NOOP_ARGS = Object.freeze({
+  aifs_read: ["encoding"],
+  aifs_share: ["inherit"]
+});
+var WRITE_BATCH_ENTRY_ARGS = Object.freeze(["path", "content", "content_file", "encoding"]);
+function contentSources(a) {
+  const used = [];
+  if (a.content !== void 0 && a.content !== null)
+    used.push("content");
+  if (typeof a.content_file === "string" && a.content_file.length > 0)
+    used.push("content_file");
+  if (a.content_stdin === true)
+    used.push("content_stdin");
+  return used;
+}
+function argWarnings(toolName, args) {
+  const known = Object.hasOwn(TOOL_ARGS, toolName) ? TOOL_ARGS[toolName] : void 0;
+  if (!known || !args || typeof args !== "object" || Array.isArray(args))
+    return [];
+  const warnings = [];
+  const unknown2 = Object.keys(args).filter((k) => !known.includes(k));
+  if (unknown2.length) {
+    warnings.push(`${toolName}: ignored unknown argument${unknown2.length > 1 ? "s" : ""} ${unknown2.map((k) => `"${k}"`).join(", ")} (accepted: ${known.length ? known.join(", ") : "none"})`);
+  }
+  if (toolName === "aifs_write") {
+    const used = contentSources(args);
+    if (used.length > 1) {
+      warnings.push(`aifs_write: more than one content source given (${used.join(", ")}); used ${used[0]}, ignored ${used.slice(1).join(", ")}`);
+    }
+  }
+  if (toolName === "aifs_write_batch" && Array.isArray(args.entries)) {
+    args.entries.forEach((e, i) => {
+      if (!e || typeof e !== "object")
+        return;
+      const extra = Object.keys(e).filter((k) => !WRITE_BATCH_ENTRY_ARGS.includes(k));
+      if (extra.length) {
+        warnings.push(`aifs_write_batch: entries[${i}] ignored unknown key${extra.length > 1 ? "s" : ""} ${extra.map((k) => `"${k}"`).join(", ")} (accepted: ${WRITE_BATCH_ENTRY_ARGS.join(", ")})`);
+      }
+      const used = contentSources(e).filter((s) => s !== "content_stdin");
+      if (used.length > 1) {
+        warnings.push(`aifs_write_batch: entries[${i}] has both content and content_file; used content, ignored content_file`);
+      }
+    });
+  }
+  return warnings;
+}
+
 // src/adapters/onedrive.js
 import { readFile as readFile2, writeFile, mkdir, rm } from "node:fs/promises";
 import { dirname as dirname2, join } from "node:path";
@@ -39287,7 +39356,11 @@ async function routeToolCall(adapter, toolName, args) {
     }
     case "aifs_get_permissions": {
       requireArgs(toolName, args, [["path", "path"]]);
-      return adapter.getPermissions(args.path, {});
+      const options = {};
+      if (Object.prototype.hasOwnProperty.call(args, "include_inherited")) {
+        options.includeInherited = args.include_inherited;
+      }
+      return adapter.getPermissions(args.path, options);
     }
     case "aifs_search": {
       requireArgs(toolName, args, ["scope"]);
@@ -39359,6 +39432,34 @@ async function main() {
         "aifs_transfer_ownership",
         "aifs_write_batch",
         "aifs_stat_batch"
+      ],
+      // Argument signatures, kept in step with routeToolCall above.
+      // "?" = optional. An unknown argument is ignored, with a warning on stderr.
+      arguments: {
+        aifs_read: "{path}",
+        aifs_write: "{path, content | content_file | content_stdin, encoding?, if_revision?}",
+        aifs_list: "{path, recursive?}",
+        aifs_exists: "{path}",
+        aifs_stat: "{path}",
+        aifs_delete: "{path}",
+        aifs_copy: "{source, destination}",
+        aifs_auth_status: "{}",
+        aifs_authenticate: '{action?: "start"|"complete", auth_code?}',
+        aifs_resolve_site: "{site_url}",
+        aifs_resolve_identity: "{ref} (aliases: email, subject, identity, upn, user, member, recipient)",
+        aifs_share: "{path, subject, role}",
+        aifs_unshare: "{path, subject}",
+        aifs_get_permissions: "{path, include_inherited?}",
+        aifs_search: '{scope, name_contains?, type?: "file"|"folder"|"any", max_results?}',
+        aifs_transfer_ownership: "{path, new_owner} (not implemented on OneDrive)",
+        aifs_write_batch: "{entries: [{path, content | content_file, encoding?}]}",
+        aifs_stat_batch: "{paths: [...]}"
+      },
+      notes: [
+        "aifs_write: give exactly one of content, content_file, content_stdin. Inline content is bounded by the OS argument limit (~128 KiB); content_file and content_stdin have no size limit. If more than one is given, content wins, then content_file, then content_stdin.",
+        'encoding "base64": a content_file/content_stdin payload is taken as raw bytes (use for binary files; otherwise it is read as UTF-8). An inline content string must itself be base64.',
+        "if_revision: revision from aifs_stat; the write fails with REVISION_CONFLICT if the file has changed since.",
+        "Paths: absolute paths address the org SharePoint library; id:{item_id} is your own OneDrive (retried once on the site library if not found); id:{drive_id}:{item_id} is that drive. aifs_search scope takes a path or an id: anchor."
       ]
     }, null, 2));
     process.exit(0);
@@ -39374,6 +39475,13 @@ async function main() {
     }
   }
   toolArgs = normalizePathArgs(toolArgs);
+  try {
+    for (const w of argWarnings(toolName, toolArgs)) {
+      process.stderr.write(`aifs-exec: warning: ${w}
+`);
+    }
+  } catch {
+  }
   initEnvironment();
   let config2;
   try {
