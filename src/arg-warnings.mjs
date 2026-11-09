@@ -33,15 +33,12 @@ export const TOOL_ARGS = Object.freeze({
 });
 
 // Arguments SPEC.md defines for the tool that this executor accepts but doesn't act on.
-// They are valid, so they don't warn: core passes include_inherited on every permission
-// check, and warning there would be noise (and Phase 2 would reject a valid call).
+// They are valid, so they don't warn (and Phase 2 must not reject a valid call).
 //   aifs_read.encoding            the onedrive read returns the default form
 //   aifs_share.inherit            inherit:false is deprecated and ignored (decision 2026-06-15)
-//   aifs_get_permissions.include_inherited   getPermissions always reports inherited entries
 export const CONTRACT_NOOP_ARGS = Object.freeze({
   aifs_read: ['encoding'],
   aifs_share: ['inherit'],
-  aifs_get_permissions: ['include_inherited'],
 });
 
 // Keys an aifs_write_batch entry may carry (routeToolCall reads e.path, e.content,

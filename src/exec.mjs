@@ -271,7 +271,7 @@ async function main() {
         'aifs_search', 'aifs_transfer_ownership',
         'aifs_write_batch', 'aifs_stat_batch'],
       // Argument signatures, kept in step with routeToolCall above.
-      // "?" = optional. Unknown arguments are ignored without an error.
+      // "?" = optional. An unknown argument is ignored, with a warning on stderr.
       arguments: {
         aifs_read: '{path}',
         aifs_write: '{path, content | content_file | content_stdin, encoding?, if_revision?}',
