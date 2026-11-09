@@ -14,6 +14,7 @@
 
 import { initEnvironment, loadConfig } from '@agent-index/filesystem';
 import { AifsError } from '@agent-index/filesystem/errors';
+import { argWarnings } from './arg-warnings.mjs';
 import { OneDriveAdapter } from './adapters/onedrive.js';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -270,7 +271,7 @@ async function main() {
         'aifs_search', 'aifs_transfer_ownership',
         'aifs_write_batch', 'aifs_stat_batch'],
       // Argument signatures, kept in step with routeToolCall above.
-      // "?" = optional. Unknown arguments are ignored without an error.
+      // "?" = optional. An unknown argument is ignored, with a warning on stderr.
       arguments: {
         aifs_read: '{path}',
         aifs_write: '{path, content | content_file | content_stdin, encoding?, if_revision?}',
@@ -311,6 +312,15 @@ async function main() {
     }
   }
   toolArgs = normalizePathArgs(toolArgs);
+
+  // CI-018 Phase 1: name ignored arguments on stderr (stdout stays the tool's
+  // output, byte-exact for aifs_read). The call still runs exactly as before.
+  // A warning must never break a call: if building or printing one fails, the call runs anyway.
+  try {
+    for (const w of argWarnings(toolName, toolArgs)) {
+      process.stderr.write(`aifs-exec: warning: ${w}\n`);
+    }
+  } catch { /* warnings are best-effort */ }
 
   initEnvironment();
 
