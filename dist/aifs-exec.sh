@@ -63,7 +63,7 @@ ignored, but a warning naming it is printed on stderr.
   aifs_auth_status         Check authentication state
                              {}
   aifs_authenticate        Initiate/complete OAuth (PKCE) flow
-                             {action?: "start" | "complete", auth_code?}
+                             {action?: "start" | "complete", auth_code?, force?}
   aifs_resolve_site        Resolve a SharePoint site URL to site and drive ids (create-org)
                              {site_url}
   aifs_resolve_identity    Resolve an email/UPN/object id to the grantable identity
@@ -100,6 +100,15 @@ id:{item_id}[/rel] is your own OneDrive (retried once on the site library if
 not found there); id:{drive_id}:{item_id}[/rel] is that drive. aifs_search's
 scope takes a path or an id: anchor. Without name_contains nothing is filtered:
 you get up to max_results (default 100, max 1000) items under scope.
+
+Org locations: use plain paths — /org-config.json, /members-registry.json,
+/shared/..., /{collection}/... The executor finds them from org-config on the
+org site drive. Drive-qualified id:{drive_id}:{item_id} addresses still work.
+
+aifs_authenticate start returns the sign-in already in progress (under 10
+minutes old); pass force:true to start over. aifs_auth_status reports
+bootstrap (ready | needs_auth | needs_setup) and member_hash from local state.
+aifs_delete refuses an org root itself (PROTECTED_ORG_PATH).
 
 Environment: AIFS_CONFIG_PATH (path to agent-index.json, auto-discovered if not set)
 

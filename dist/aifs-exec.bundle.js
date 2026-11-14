@@ -37628,6 +37628,430 @@ var NotProvisionedError = class extends AifsError {
   }
 };
 
+// ../agent-index-filesystem/src/org-map.js
+import { readFile as readFile2, writeFile, rename, mkdir } from "node:fs/promises";
+import { join, dirname as dirname2 } from "node:path";
+var ORG_MAP_FILENAME = "org-map.json";
+var ORG_MAP_SCHEMA = 1;
+var IDEMPOTENT_TOOLS = /* @__PURE__ */ new Set([
+  "aifs_read",
+  "aifs_exists",
+  "aifs_stat",
+  "aifs_list",
+  "aifs_search",
+  "aifs_get_permissions",
+  "aifs_stat_batch"
+]);
+function isPlainPath(p) {
+  return typeof p === "string" && p.startsWith("/") && !p.startsWith("//");
+}
+function normalizePlain(p) {
+  let s = "/" + String(p).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+  s = s.replace(/\/+/g, "/");
+  return s === "" ? "/" : s;
+}
+function firstSegment(p) {
+  if (!isPlainPath(p))
+    return null;
+  const seg = normalizePlain(p).split("/")[1];
+  return seg ? seg.toLowerCase() : null;
+}
+function pathArgs(toolName, args) {
+  const out = [];
+  if (!args || typeof args !== "object")
+    return out;
+  for (const k of ["path", "source", "destination", "scope"]) {
+    if (typeof args[k] === "string")
+      out.push(args[k]);
+  }
+  if (Array.isArray(args.entries)) {
+    for (const e of args.entries)
+      if (e && typeof e.path === "string")
+        out.push(e.path);
+  }
+  if (Array.isArray(args.paths)) {
+    for (const p of args.paths)
+      if (typeof p === "string")
+        out.push(p);
+  }
+  return out;
+}
+function needsOrgMap(toolName, args) {
+  return pathArgs(toolName, args).some((p) => firstSegment(p) !== null);
+}
+function sharedPrefixFrom(orgConfig) {
+  const raw = orgConfig?.paths?.shared_root;
+  if (typeof raw === "string" && raw.trim().startsWith("/")) {
+    const p = normalizePlain(raw.trim());
+    if (p !== "/")
+      return p;
+  }
+  return "/shared";
+}
+function buildPrefixes(orgConfig, { orgConfigId } = {}) {
+  const prefixes = {};
+  const dropped = [];
+  const shared = sharedPrefixFrom(orgConfig);
+  const rid = orgConfig?.resource_ids || {};
+  if (orgConfigId)
+    prefixes["/org-config.json"] = { id: String(orgConfigId), kind: "file" };
+  if (rid.members_registry)
+    prefixes["/members-registry.json"] = { id: String(rid.members_registry), kind: "file" };
+  if (rid.shared_root)
+    prefixes[shared] = { id: String(rid.shared_root), kind: "folder" };
+  const reserved = /* @__PURE__ */ new Set(["org-config.json", "members-registry.json", shared.split("/")[1].toLowerCase()]);
+  const seen = new Set(Object.keys(prefixes).map((k) => k.split("/")[1].toLowerCase()));
+  for (const c of Array.isArray(orgConfig?.installed_collections) ? orgConfig.installed_collections : []) {
+    if (!c || typeof c.name !== "string" || !c.name || !c.folder_id)
+      continue;
+    const name = c.name.trim();
+    if (!name || name.includes("/")) {
+      dropped.push({ name, reason: "invalid_name" });
+      continue;
+    }
+    const lower = name.toLowerCase();
+    if (reserved.has(lower)) {
+      dropped.push({ name, reason: "name_collision" });
+      continue;
+    }
+    if (seen.has(lower)) {
+      dropped.push({ name, reason: "duplicate_name" });
+      continue;
+    }
+    seen.add(lower);
+    prefixes["/" + name] = { id: String(c.folder_id), kind: "folder" };
+  }
+  return { prefixes, shared_prefix: shared, dropped };
+}
+function matchOrgPrefix(map2, path) {
+  if (!map2 || !isPlainPath(path))
+    return null;
+  const norm = normalizePlain(path);
+  const parts = norm.split("/").filter(Boolean);
+  let best = null;
+  for (const key of Object.keys(map2.prefixes || {})) {
+    const kp = key.split("/").filter(Boolean);
+    if (kp.length === 0 || kp.length > parts.length)
+      continue;
+    let ok = kp[0].toLowerCase() === parts[0].toLowerCase();
+    for (let i = 1; ok && i < kp.length; i++)
+      ok = kp[i] === parts[i];
+    if (ok && (!best || kp.length > best.depth)) {
+      best = { prefix: key, depth: kp.length, entry: map2.prefixes[key], rest: parts.slice(kp.length).join("/") };
+    }
+  }
+  if (!best)
+    return null;
+  return { prefix: best.prefix, id: best.entry.id, kind: best.entry.kind, rest: best.rest };
+}
+function canonicalizePath(map2, path) {
+  const m = matchOrgPrefix(map2, path);
+  if (!m)
+    return path;
+  return m.rest ? `${m.prefix}/${m.rest}` : m.prefix;
+}
+function canonicalizeArgs(map2, toolName, args) {
+  if (!map2 || !args || typeof args !== "object")
+    return args;
+  const out = { ...args };
+  for (const k of ["path", "source", "destination", "scope"]) {
+    if (typeof out[k] === "string")
+      out[k] = canonicalizePath(map2, out[k]);
+  }
+  if (Array.isArray(out.entries)) {
+    out.entries = out.entries.map((e) => e && typeof e.path === "string" ? { ...e, path: canonicalizePath(map2, e.path) } : e);
+  }
+  if (Array.isArray(out.paths)) {
+    out.paths = out.paths.map((p) => typeof p === "string" ? canonicalizePath(map2, p) : p);
+  }
+  return out;
+}
+function touchesMappedPrefix(map2, toolName, args) {
+  return pathArgs(toolName, args).some((p) => matchOrgPrefix(map2, p) !== null);
+}
+function isProtectedOrgPath(map2, path) {
+  const m = matchOrgPrefix(map2, path);
+  return !!m && m.rest === "";
+}
+function identity(config2) {
+  const conn = config2?.connection || {};
+  return {
+    backend: config2?.backend || null,
+    drive_id: conn.drive_id || null,
+    org_config_id: conn.org_config_id || null
+  };
+}
+async function readMapFile(credentialStore, config2) {
+  try {
+    const data = JSON.parse(await readFile2(join(credentialStore, ORG_MAP_FILENAME), "utf-8"));
+    const id = identity(config2);
+    if (data.schema !== ORG_MAP_SCHEMA)
+      return null;
+    if ((data.backend || null) !== id.backend)
+      return null;
+    if ((data.drive_id || null) !== id.drive_id)
+      return null;
+    if ((data.org_config_id || null) !== id.org_config_id)
+      return null;
+    if (!data.prefixes || typeof data.prefixes !== "object")
+      return null;
+    data.misses = data.misses && typeof data.misses === "object" ? data.misses : {};
+    return data;
+  } catch {
+    return null;
+  }
+}
+async function saveOrgMap(credentialStore, map2) {
+  if (!map2)
+    return;
+  const target = join(credentialStore, ORG_MAP_FILENAME);
+  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await mkdir(dirname2(target), { recursive: true });
+    await writeFile(tmp, JSON.stringify(map2), "utf-8");
+    await rename(tmp, target);
+  } catch {
+  }
+}
+function orgConfigAddress(config2) {
+  const conn = config2?.connection || {};
+  if (config2?.backend === "gdrive")
+    return conn.org_config_id ? `id:${conn.org_config_id}` : null;
+  return "/org-config.json";
+}
+async function orgConfigRevision(adapter, address) {
+  const st = await adapter.stat(address);
+  return st?.revision ?? null;
+}
+async function validatePrefixes(adapter, config2, prefixes, dropped, warn) {
+  const orgDrive = config2?.connection?.drive_id || null;
+  if (!orgDrive || typeof adapter.stat !== "function")
+    return { prefixes, complete: true };
+  const onedrive = config2?.backend === "onedrive";
+  const sameDrive = (d) => onedrive ? String(d).toLowerCase() === String(orgDrive).toLowerCase() : d === orgDrive;
+  const out = {};
+  let complete = true;
+  const keys = Object.keys(prefixes);
+  const results = [];
+  for (let i = 0; i < keys.length; i += 4) {
+    const batch = keys.slice(i, i + 4);
+    results.push(...await Promise.all(batch.map(async (k) => {
+      const e = prefixes[k];
+      if (e.kind !== "folder")
+        return { k, ok: true };
+      try {
+        const st = await adapter.stat(onedrive ? `id:${orgDrive}:${e.id}` : `id:${e.id}`);
+        const d = st?.drive_id ?? null;
+        if (d !== null && sameDrive(d))
+          return { k, ok: true };
+        return { k, ok: false, reason: "outside_org_drive", detail: d };
+      } catch (err) {
+        return { k, ok: false, reason: "unverified", detail: err?.code || "stat_failed", transient: true };
+      }
+    })));
+  }
+  for (const r of results) {
+    if (r.ok) {
+      out[r.k] = prefixes[r.k];
+      continue;
+    }
+    if (r.transient)
+      complete = false;
+    dropped.push({ prefix: r.k, reason: r.reason, detail: r.detail });
+    warn(`aifs: org map: dropped ${r.k} (${r.reason}${r.detail ? `: ${r.detail}` : ""})`);
+  }
+  return { prefixes: out, complete };
+}
+async function build(ctx) {
+  const { config: config2, adapter, warn } = ctx;
+  const address = orgConfigAddress(config2);
+  if (!address)
+    return { map: null, reason: "no_org_config_id" };
+  let revision = null;
+  try {
+    revision = await orgConfigRevision(adapter, address);
+  } catch (err) {
+    return { map: null, reason: `org_config_unreadable:${err?.code || err?.message || "error"}` };
+  }
+  let orgConfig;
+  try {
+    const raw = await adapter.read(address);
+    orgConfig = JSON.parse(typeof raw === "string" ? raw : String(raw));
+  } catch (err) {
+    return { map: null, reason: `org_config_unreadable:${err?.code || "parse_error"}` };
+  }
+  const id = identity(config2);
+  const { prefixes, shared_prefix, dropped } = buildPrefixes(orgConfig, { orgConfigId: id.org_config_id });
+  for (const d of dropped)
+    warn(`aifs: org map: dropped collection "${d.name}" (${d.reason})`);
+  const { prefixes: validated, complete } = await validatePrefixes(adapter, config2, prefixes, dropped, warn);
+  const map2 = {
+    schema: ORG_MAP_SCHEMA,
+    ...id,
+    org_config_revision: revision,
+    built_at: (/* @__PURE__ */ new Date()).toISOString(),
+    shared_prefix,
+    prefixes: validated,
+    misses: {}
+  };
+  return { map: map2, reason: null, rebuilt: true, persist: complete };
+}
+async function resolveOrgMap({ config: config2, adapter, credentialStore, mode = "normal", segment = null, warn = () => {
+} }) {
+  const ctx = { config: config2, adapter, warn };
+  try {
+    const cached2 = await readMapFile(credentialStore, config2);
+    if (!cached2) {
+      const r = await build(ctx);
+      if (r.map && mode === "missing-prefix" && segment && !matchOrgPrefix(r.map, "/" + segment)) {
+        r.map.misses[segment.toLowerCase()] = r.map.org_config_revision;
+      }
+      if (r.map && r.persist)
+        await saveOrgMap(credentialStore, r.map);
+      return { map: r.map, reason: r.reason, rebuilt: !!r.map };
+    }
+    if (mode === "normal")
+      return { map: cached2, reason: null, rebuilt: false };
+    if (mode === "missing-prefix") {
+      const seg = (segment || "").toLowerCase();
+      if (seg && cached2.misses[seg] && cached2.misses[seg] === cached2.org_config_revision) {
+        return { map: cached2, reason: null, rebuilt: false };
+      }
+    }
+    const address = orgConfigAddress(config2);
+    let revision;
+    try {
+      revision = await orgConfigRevision(adapter, address);
+    } catch {
+      return { map: cached2, reason: null, rebuilt: false };
+    }
+    if (revision !== null && revision !== cached2.org_config_revision) {
+      const r = await build(ctx);
+      if (r.map) {
+        if (mode === "missing-prefix" && segment && !matchOrgPrefix(r.map, "/" + segment)) {
+          r.map.misses[segment.toLowerCase()] = r.map.org_config_revision;
+        }
+        if (r.persist)
+          await saveOrgMap(credentialStore, r.map);
+        return { map: r.map, reason: null, rebuilt: true };
+      }
+      return { map: cached2, reason: null, rebuilt: false };
+    }
+    if (mode === "missing-prefix" && segment) {
+      cached2.misses[segment.toLowerCase()] = cached2.org_config_revision;
+      await saveOrgMap(credentialStore, cached2);
+    }
+    return { map: cached2, reason: null, rebuilt: false };
+  } catch (err) {
+    return { map: null, reason: `org_map_error:${err?.message || "error"}`, rebuilt: false };
+  }
+}
+function missingSegments(map2, toolName, args) {
+  const out = /* @__PURE__ */ new Set();
+  for (const p of pathArgs(toolName, args)) {
+    const seg = firstSegment(p);
+    if (!seg)
+      continue;
+    if (!matchOrgPrefix(map2, p))
+      out.add(seg);
+  }
+  return [...out];
+}
+
+// ../agent-index-filesystem/src/session-state.js
+import { readFile as readFile3, writeFile as writeFile2, rename as rename2, mkdir as mkdir2, unlink } from "node:fs/promises";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import { join as join2, dirname as dirname3 } from "node:path";
+import { createHash } from "node:crypto";
+var PENDING_AUTH_FILENAME = "pending-auth.json";
+var IDENTITY_FILENAME = "identity.json";
+var PENDING_AUTH_MAX_AGE_MS = 10 * 60 * 1e3;
+async function writeAtomic(path, data) {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await mkdir2(dirname3(path), { recursive: true });
+    await writeFile2(tmp, JSON.stringify(data), "utf-8");
+    await rename2(tmp, path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function readJson(path) {
+  try {
+    return JSON.parse(await readFile3(path, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+async function readPendingAuth(credentialStore, now = Date.now()) {
+  const p = await readJson(join2(credentialStore, PENDING_AUTH_FILENAME));
+  if (!p || typeof p.auth_url !== "string" || typeof p.created !== "number")
+    return null;
+  if (now - p.created >= PENDING_AUTH_MAX_AGE_MS)
+    return null;
+  return p;
+}
+async function writePendingAuth(credentialStore, { auth_url, message }, now = Date.now()) {
+  return writeAtomic(join2(credentialStore, PENDING_AUTH_FILENAME), { auth_url, message: message || null, created: now });
+}
+async function clearPendingAuth(credentialStore) {
+  const path = join2(credentialStore, PENDING_AUTH_FILENAME);
+  try {
+    await unlink(path);
+  } catch {
+    await writeAtomic(path, { created: 0 });
+  }
+}
+function reusedAuthResponse(pending) {
+  return {
+    status: "awaiting_code",
+    reused: true,
+    auth_url: pending.auth_url,
+    message: 'A sign-in is already in progress; this is the same link. Open it, sign in, then paste the full redirected URL (or the bare code) back and call aifs_authenticate with action:"complete". To start over instead (for example to use a different account), call action:"start" with force:true.'
+  };
+}
+async function writeIdentity(credentialStore, email3) {
+  if (typeof email3 !== "string" || !email3.includes("@"))
+    return false;
+  return writeAtomic(join2(credentialStore, IDENTITY_FILENAME), { email: email3.toLowerCase(), saved: (/* @__PURE__ */ new Date()).toISOString() });
+}
+async function readIdentity(credentialStore) {
+  const d = await readJson(join2(credentialStore, IDENTITY_FILENAME));
+  return d && typeof d.email === "string" ? d.email : null;
+}
+function memberHash(email3, length = 16) {
+  return createHash("sha256").update(String(email3).toLowerCase()).digest("hex").slice(0, length);
+}
+function bootstrapState({ configPath, authenticated, email: email3 }) {
+  try {
+    if (!configPath || !existsSync2(configPath)) {
+      return { bootstrap: "needs_setup", reason: "no_agent_index_json" };
+    }
+    let cfg = {};
+    try {
+      cfg = JSON.parse(readFileSync2(configPath, "utf-8"));
+    } catch {
+    }
+    if (!cfg?.remote_filesystem?.backend) {
+      return { bootstrap: "needs_setup", reason: "no_backend_configured" };
+    }
+    if (!authenticated)
+      return { bootstrap: "needs_auth", reason: "not_signed_in" };
+    if (!email3 || email3 === "unknown")
+      return { bootstrap: "needs_auth", reason: "identity_unknown" };
+    const length = Number(cfg?.identity_resolution?.hash_length) || 16;
+    const hash2 = memberHash(email3, length);
+    const memberIndex = join2(dirname3(configPath), "members", hash2, "member-index.json");
+    if (!existsSync2(memberIndex)) {
+      return { bootstrap: "needs_setup", reason: "no_member_workspace", member_hash: hash2 };
+    }
+    return { bootstrap: "ready", member_hash: hash2 };
+  } catch (err) {
+    return { bootstrap: "needs_setup", reason: `check_failed:${err?.message || "error"}` };
+  }
+}
+
 // src/arg-warnings.mjs
 var TOOL_ARGS = Object.freeze({
   aifs_read: ["path", "encoding"],
@@ -37638,7 +38062,7 @@ var TOOL_ARGS = Object.freeze({
   aifs_delete: ["path"],
   aifs_copy: ["source", "destination"],
   aifs_auth_status: [],
-  aifs_authenticate: ["action", "auth_code"],
+  aifs_authenticate: ["action", "auth_code", "force"],
   aifs_resolve_site: ["site_url"],
   // ref, plus the aliases routeToolCall coalesces into it
   aifs_resolve_identity: ["ref", "email", "subject", "identity", "upn", "user", "member", "recipient"],
@@ -37698,9 +38122,9 @@ function argWarnings(toolName, args) {
 }
 
 // src/adapters/onedrive.js
-import { readFile as readFile2, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname as dirname2, join } from "node:path";
-import { randomBytes, createHash } from "node:crypto";
+import { readFile as readFile4, writeFile as writeFile3, mkdir as mkdir3, rm } from "node:fs/promises";
+import { dirname as dirname4, join as join3 } from "node:path";
+import { randomBytes, createHash as createHash2 } from "node:crypto";
 import { tmpdir } from "node:os";
 var ExternalShareBlockedError = class extends AifsError {
   constructor(subject, path, graph = {}, opts = {}) {
@@ -37794,12 +38218,12 @@ var OneDriveAdapter = class {
         'OneDrive connection carries a "client_secret", but this adapter is a public client (PKCE, no secret). Remove client_secret and register the app with "Allow public client flows = Yes".'
       );
     }
-    this.credentialPath = join(credentialStore, "onedrive.json");
-    this.pkcePath = join(credentialStore, "onedrive-pkce.json");
-    const pkceKey = createHash("sha256").update(`${connection.tenant_id}:${connection.client_id}`).digest("hex").slice(0, 16);
-    this.pkceTmpPath = join(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
+    this.credentialPath = join3(credentialStore, "onedrive.json");
+    this.pkcePath = join3(credentialStore, "onedrive-pkce.json");
+    const pkceKey = createHash2("sha256").update(`${connection.tenant_id}:${connection.client_id}`).digest("hex").slice(0, 16);
+    this.pkceTmpPath = join3(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
-      this.tokens = JSON.parse(await readFile2(this.credentialPath, "utf-8"));
+      this.tokens = JSON.parse(await readFile4(this.credentialPath, "utf-8"));
     } catch {
       this.tokens = null;
     }
@@ -37835,7 +38259,7 @@ var OneDriveAdapter = class {
   }
   _authUrl(verifier) {
     this._codeVerifier = verifier || randomBytes(32).toString("base64url");
-    const codeChallenge = createHash("sha256").update(this._codeVerifier).digest("base64url");
+    const codeChallenge = createHash2("sha256").update(this._codeVerifier).digest("base64url");
     const params = new URLSearchParams({
       client_id: this.connection.client_id,
       response_type: "code",
@@ -37859,8 +38283,8 @@ var OneDriveAdapter = class {
     let wrote = false;
     for (const p of this._pkcePaths()) {
       try {
-        await mkdir(dirname2(p), { recursive: true });
-        await writeFile(p, payload, "utf-8");
+        await mkdir3(dirname4(p), { recursive: true });
+        await writeFile3(p, payload, "utf-8");
         wrote = true;
       } catch (err) {
         console.error(`[aifs] Warning: could not persist PKCE verifier to ${p}: ${err.message}`);
@@ -37872,7 +38296,7 @@ var OneDriveAdapter = class {
   async _readVerifier() {
     for (const p of this._pkcePaths()) {
       try {
-        const v = JSON.parse(await readFile2(p, "utf-8"));
+        const v = JSON.parse(await readFile4(p, "utf-8"));
         if (v?.code_verifier)
           return v;
       } catch {
@@ -37969,6 +38393,25 @@ var OneDriveAdapter = class {
       message: `Successfully authenticated to Microsoft 365 as ${email3}.`
     };
   }
+  // ─── Org path seeding (CI-025, 2.8.0) ───────────────────────────────
+  /**
+   * Seed from the org map (shared library org-map.js). Plain paths already
+   * resolve on OneDrive, so paths are left alone. The org's own item ids are
+   * registered on the configured site drive, so a bare `id:{item}` for an org
+   * item resolves there directly instead of probing the member's own drive
+   * first (finding 63; technical design §2.6).
+   */
+  seedOrgPrefixes(prefixes) {
+    if (!prefixes || typeof prefixes !== "object")
+      return;
+    const configured = this._configuredDriveBase();
+    if (!configured || configured === "/me/drive")
+      return;
+    for (const entry of Object.values(prefixes)) {
+      if (entry && entry.id && !this._anchorBase.has(entry.id))
+        this._anchorBase.set(entry.id, configured);
+    }
+  }
   // ─── File operations ─────────────────────────────────────────────────
   async read(path) {
     await this._ensureAuth();
@@ -37999,6 +38442,34 @@ var OneDriveAdapter = class {
               "AIFS_READ_UNRELIABLE",
               `read: backend returned empty content for "${path}" but metadata reports ${declaredSize} bytes (retried ${READ_RETRY_BACKOFF_MS.length}x). Transient backend failure \u2014 retry; do NOT treat as empty.`,
               { path, declared_size: declaredSize, retries: READ_RETRY_BACKOFF_MS.length }
+            );
+          }
+        }
+      }
+      if (buffer.length > 0) {
+        const metaSize = async () => {
+          try {
+            const r = await this._graph(`${addr.meta}?$select=size`);
+            const n = (await r.json())?.size;
+            return typeof n === "number" ? n : null;
+          } catch {
+            return null;
+          }
+        };
+        let declared = await metaSize();
+        if (declared !== null && declared !== buffer.length) {
+          for (const delay of READ_RETRY_BACKOFF_MS) {
+            await aifsSleep(delay);
+            buffer = await fetchBuffer();
+            declared = await metaSize();
+            if (declared === null || declared === buffer.length)
+              break;
+          }
+          if (declared !== null && declared !== buffer.length) {
+            throw new AifsError(
+              "AIFS_READ_UNRELIABLE",
+              `read: content returned for "${path}" doesn't match the file's current size (got ${buffer.length} bytes, metadata reports ${declared}; retried ${READ_RETRY_BACKOFF_MS.length}x). Stale or incomplete read \u2014 retry; do NOT use this content.`,
+              { path, reason: "size_mismatch", declared_size: declared, received_size: buffer.length, retries: READ_RETRY_BACKOFF_MS.length }
             );
           }
         }
@@ -38675,7 +39146,18 @@ var OneDriveAdapter = class {
       let p = this._idToPath(f.id);
       if (!p) {
         const baseScope = isRoot ? "" : norm.replace(/\/$/, "");
-        p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        const parentPath = typeof f.parentReference?.path === "string" ? (() => {
+          try {
+            return decodeURIComponent(f.parentReference.path.replace(/^.*?root:/, ""));
+          } catch {
+            return null;
+          }
+        })() : null;
+        if (!this._isAnchor(scope) && parentPath !== null && (parentPath === "" || parentPath.startsWith("/"))) {
+          p = `${parentPath.replace(/\/$/, "")}/${f.name}`;
+        } else {
+          p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        }
       }
       results.push({
         path: p,
@@ -39140,8 +39622,8 @@ var OneDriveAdapter = class {
     }
   }
   async _writeCredential(tokens) {
-    await mkdir(dirname2(this.credentialPath), { recursive: true });
-    await writeFile(this.credentialPath, JSON.stringify(tokens, null, 2), "utf-8");
+    await mkdir3(dirname4(this.credentialPath), { recursive: true });
+    await writeFile3(this.credentialPath, JSON.stringify(tokens, null, 2), "utf-8");
   }
   // ─── Path helpers (id-anchor aware) ──────────────────────────────────
   _normalizePath(path) {
@@ -39192,8 +39674,8 @@ var OneDriveAdapter = class {
 };
 
 // src/exec.mjs
-import { readFile as readFile3, writeFile as writeFile2, mkdir as mkdir2 } from "node:fs/promises";
-import { join as join2, dirname as dirname3 } from "node:path";
+import { readFile as readFile5, writeFile as writeFile4, mkdir as mkdir4 } from "node:fs/promises";
+import { join as join4, dirname as dirname5 } from "node:path";
 var VERBOSE = process.env.AIFS_VERBOSE === "1" || process.argv.includes("--verbose");
 var DEBUG_FIELDS = /* @__PURE__ */ new Set(["debug", "raw_response", "_trace", "_timing"]);
 function stripDebugFields(value) {
@@ -39213,29 +39695,35 @@ function normalizePathArgs(args) {
   if (!args || typeof args !== "object")
     return args;
   const out = { ...args };
-  for (const key of ["path", "source", "destination"]) {
-    if (typeof out[key] === "string" && !out[key].startsWith("id:")) {
-      out[key] = out[key].replace(/\\/g, "/");
-    }
+  const fix = (p) => typeof p === "string" && !p.startsWith("id:") ? p.replace(/\\/g, "/") : p;
+  for (const key of ["path", "source", "destination", "scope"]) {
+    if (typeof out[key] === "string")
+      out[key] = fix(out[key]);
   }
+  if (Array.isArray(out.entries))
+    out.entries = out.entries.map((e) => e && typeof e.path === "string" ? { ...e, path: fix(e.path) } : e);
+  if (Array.isArray(out.paths))
+    out.paths = out.paths.map(fix);
   return out;
 }
 var PATH_CACHE_FILENAME = "path-cache.json";
 var PATH_CACHE_MAX_AGE_MS = 30 * 60 * 1e3;
 var PATH_CACHE_MAX_ENTRIES = 2e3;
 async function loadPathCache(credentialStore) {
-  const cachePath = join2(credentialStore, PATH_CACHE_FILENAME);
+  const cachePath = join4(credentialStore, PATH_CACHE_FILENAME);
   try {
-    const data = JSON.parse(await readFile3(cachePath, "utf-8"));
+    const data = JSON.parse(await readFile5(cachePath, "utf-8"));
     if (data.timestamp && Date.now() - data.timestamp > PATH_CACHE_MAX_AGE_MS)
       return /* @__PURE__ */ new Map();
-    return new Map(Object.entries(data.entries || {}));
+    const map2 = new Map(Object.entries(data.entries || {}));
+    map2._createdAt = typeof data.timestamp === "number" ? data.timestamp : Date.now();
+    return map2;
   } catch {
     return /* @__PURE__ */ new Map();
   }
 }
-async function savePathCache(credentialStore, pathCache) {
-  const cachePath = join2(credentialStore, PATH_CACHE_FILENAME);
+async function savePathCache(credentialStore, pathCache, createdAt = Date.now()) {
+  const cachePath = join4(credentialStore, PATH_CACHE_FILENAME);
   const entries = {};
   let count = 0;
   for (const [key, value] of pathCache) {
@@ -39245,8 +39733,8 @@ async function savePathCache(credentialStore, pathCache) {
     count++;
   }
   try {
-    await mkdir2(dirname3(cachePath), { recursive: true });
-    await writeFile2(cachePath, JSON.stringify({ timestamp: Date.now(), entries }), "utf-8");
+    await mkdir4(dirname5(cachePath), { recursive: true });
+    await writeFile4(cachePath, JSON.stringify({ timestamp: createdAt, entries }), "utf-8");
   } catch {
   }
 }
@@ -39270,7 +39758,7 @@ function requireArgs(toolName, args, required2) {
     );
   }
 }
-async function routeToolCall(adapter, toolName, args) {
+async function routeToolCall(adapter, toolName, args, ctx = {}) {
   switch (toolName) {
     case "aifs_read":
       requireArgs(toolName, args, [["path", "path"]]);
@@ -39280,7 +39768,7 @@ async function routeToolCall(adapter, toolName, args) {
       let content = args.content;
       if (content === void 0 || content === null) {
         if (typeof args.content_file === "string" && args.content_file.length > 0) {
-          const payload = await readFile3(args.content_file);
+          const payload = await readFile5(args.content_file);
           content = args.encoding === "base64" ? payload.toString("base64") : payload.toString("utf-8");
         } else if (args.content_stdin === true) {
           const chunks = [];
@@ -39323,14 +39811,46 @@ async function routeToolCall(adapter, toolName, args) {
       await adapter.copy(args.source, args.destination);
       return { success: true };
     }
-    case "aifs_auth_status":
-      return adapter.getAuthStatus();
+    case "aifs_auth_status": {
+      const status = await adapter.getAuthStatus();
+      let email3 = status?.user_identity && status.user_identity !== "unknown" ? status.user_identity : null;
+      if (email3 && ctx.credentialStore)
+        await writeIdentity(ctx.credentialStore, email3);
+      if (!email3 && ctx.credentialStore)
+        email3 = await readIdentity(ctx.credentialStore);
+      const b = bootstrapState({ configPath: process.env.AIFS_CONFIG_PATH, authenticated: !!status?.authenticated, email: email3 });
+      return {
+        ...status,
+        bootstrap: b.bootstrap,
+        ...b.member_hash ? { member_hash: b.member_hash } : {},
+        ...b.reason ? { bootstrap_reason: b.reason } : {}
+      };
+    }
     case "aifs_authenticate": {
       const action = args.action || (args.auth_code ? "complete" : "start");
-      if (action === "start")
-        return adapter.startAuth();
-      if (action === "complete")
-        return adapter.completeAuth(args.auth_code);
+      if (action === "start") {
+        if (!args.force && ctx.credentialStore) {
+          const pending = await readPendingAuth(ctx.credentialStore);
+          const verifier = pending && typeof adapter._readVerifier === "function" ? await adapter._readVerifier() : null;
+          if (pending && verifier?.code_verifier)
+            return reusedAuthResponse(pending);
+        }
+        if (args.force && typeof adapter._clearVerifier === "function")
+          await adapter._clearVerifier();
+        const started = await adapter.startAuth();
+        if (ctx.credentialStore && started?.auth_url)
+          await writePendingAuth(ctx.credentialStore, started);
+        return started;
+      }
+      if (action === "complete") {
+        const done = await adapter.completeAuth(args.auth_code);
+        if (ctx.credentialStore) {
+          await clearPendingAuth(ctx.credentialStore);
+          if (done?.user_identity)
+            await writeIdentity(ctx.credentialStore, done.user_identity);
+        }
+        return done;
+      }
       throw new AifsError(
         "INVALID_ARGS",
         `Unknown auth action: ${action}`,
@@ -39384,7 +39904,7 @@ async function routeToolCall(adapter, toolName, args) {
         let content = e.content;
         if (content === void 0 || content === null) {
           if (typeof e.content_file === "string" && e.content_file.length > 0) {
-            const payload = await readFile3(e.content_file);
+            const payload = await readFile5(e.content_file);
             content = e.encoding === "base64" ? payload.toString("base64") : payload.toString("utf-8");
           } else {
             throw new AifsError("INVALID_ARGS", `${toolName}: entries[${i}] ('${e.path}') has neither 'content' nor 'content_file'`, { tool: toolName, index: i });
@@ -39444,7 +39964,7 @@ async function main() {
         aifs_delete: "{path}",
         aifs_copy: "{source, destination}",
         aifs_auth_status: "{}",
-        aifs_authenticate: '{action?: "start"|"complete", auth_code?}',
+        aifs_authenticate: '{action?: "start"|"complete", auth_code?, force?}',
         aifs_resolve_site: "{site_url}",
         aifs_resolve_identity: "{ref} (aliases: email, subject, identity, upn, user, member, recipient)",
         aifs_share: "{path, subject, role}",
@@ -39459,7 +39979,10 @@ async function main() {
         "aifs_write: give exactly one of content, content_file, content_stdin. Inline content is bounded by the OS argument limit (~128 KiB); content_file and content_stdin have no size limit. If more than one is given, content wins, then content_file, then content_stdin.",
         'encoding "base64": a content_file/content_stdin payload is taken as raw bytes (use for binary files; otherwise it is read as UTF-8). An inline content string must itself be base64.',
         "if_revision: revision from aifs_stat; the write fails with REVISION_CONFLICT if the file has changed since.",
-        "Paths: absolute paths address the org SharePoint library; id:{item_id} is your own OneDrive (retried once on the site library if not found); id:{drive_id}:{item_id} is that drive. aifs_search scope takes a path or an id: anchor."
+        "Paths: absolute paths address the org SharePoint library; id:{item_id} is your own OneDrive (retried once on the site library if not found); id:{drive_id}:{item_id} is that drive. aifs_search scope takes a path or an id: anchor.",
+        "Org locations are addressed by plain path: /org-config.json, /members-registry.json, /shared/..., /{collection}/... The executor finds them from org-config on the org site drive (2.8.0). Drive-qualified id:{drive_id}:{item_id} addresses still work and pass through unchanged.",
+        'aifs_authenticate {action?: "start"|"complete", auth_code?, force?}: start returns the sign-in already in progress (under 10 minutes old) instead of a new link; pass force:true to start over.',
+        "aifs_auth_status also returns bootstrap: ready | needs_auth | needs_setup, from local files only."
       ]
     }, null, 2));
     process.exit(0);
@@ -39501,28 +40024,88 @@ async function main() {
     console.log(JSON.stringify({ error: "INIT_ERROR", message: `Adapter initialization failed: ${err.message}` }));
     process.exit(1);
   }
-  const cachedPaths = await loadPathCache(config2.auth.credentialStore);
+  const credentialStore = config2.auth.credentialStore;
+  const cachedPaths = await loadPathCache(credentialStore);
+  const cacheCreatedAt = cachedPaths._createdAt || Date.now();
   for (const [path, entry] of cachedPaths) {
     if (!adapter.pathCache.has(path))
       adapter.pathCache.set(path, entry);
   }
+  const warn = (m) => {
+    try {
+      process.stderr.write(m + "\n");
+    } catch {
+    }
+  };
+  let orgMap = null;
+  let orgMapReason = null;
+  if (needsOrgMap(toolName, toolArgs)) {
+    try {
+      const ctx = { config: config2, adapter, credentialStore, warn };
+      let r = await resolveOrgMap(ctx);
+      orgMap = r.map;
+      if (!orgMap) {
+        orgMapReason = r.reason;
+        warn(`aifs: org map unavailable (${r.reason}); paths resolved without it`);
+      } else {
+        for (const seg of missingSegments(orgMap, toolName, toolArgs)) {
+          r = await resolveOrgMap({ ...ctx, mode: "missing-prefix", segment: seg });
+          if (r.map)
+            orgMap = r.map;
+        }
+        toolArgs = canonicalizeArgs(orgMap, toolName, toolArgs);
+        adapter.seedOrgPrefixes(orgMap.prefixes);
+      }
+    } catch (err) {
+      orgMap = null;
+      orgMapReason = `org_map_error:${err?.message || "error"}`;
+      warn(`aifs: org map unavailable (${orgMapReason}); paths resolved without it`);
+    }
+  }
+  let exitCode = 0;
   try {
-    const result = await routeToolCall(adapter, toolName, toolArgs);
+    if (toolName === "aifs_delete" && orgMap && isProtectedOrgPath(orgMap, toolArgs?.path)) {
+      throw new AifsError(
+        "PROTECTED_ORG_PATH",
+        `aifs_delete refused: "${toolArgs.path}" is an org root (the shared root, a collection folder, org-config or the members registry).`,
+        { path: toolArgs.path }
+      );
+    }
+    let result;
+    try {
+      result = await routeToolCall(adapter, toolName, toolArgs, { credentialStore });
+    } catch (err) {
+      const notFound = err?.code === "FILE_NOT_FOUND" || err?.code === "PATH_NOT_FOUND";
+      if (!(orgMap && notFound && IDEMPOTENT_TOOLS.has(toolName) && touchesMappedPrefix(orgMap, toolName, toolArgs)))
+        throw err;
+      const r = await resolveOrgMap({ config: config2, adapter, credentialStore, mode: "not-found", warn });
+      if (!r.rebuilt || !r.map)
+        throw err;
+      orgMap = r.map;
+      adapter.seedOrgPrefixes(orgMap.prefixes);
+      result = await routeToolCall(adapter, toolName, toolArgs, { credentialStore });
+    }
     const stripped = typeof result === "string" ? result : stripDebugFields(result);
     if (typeof stripped === "string") {
       process.stdout.write(stripped);
     } else {
       console.log(JSON.stringify(stripped, null, 2));
     }
-    await savePathCache(config2.auth.credentialStore, adapter.pathCache);
   } catch (err) {
+    exitCode = 1;
     if (err instanceof AifsError) {
-      console.log(JSON.stringify(stripDebugFields(err.toResponse()), null, 2));
-      process.exit(1);
+      const resp = stripDebugFields(err.toResponse());
+      if (orgMapReason && resp && typeof resp === "object")
+        resp.org_map = orgMapReason;
+      console.log(JSON.stringify(resp, null, 2));
+    } else {
+      console.log(JSON.stringify({ error: "BACKEND_ERROR", message: err.message }));
     }
-    console.log(JSON.stringify({ error: "BACKEND_ERROR", message: err.message }));
-    process.exit(1);
+  } finally {
+    await savePathCache(credentialStore, adapter.pathCache, cacheCreatedAt);
   }
+  if (exitCode)
+    process.exit(exitCode);
 }
 main();
 /*! Bundled license information:
