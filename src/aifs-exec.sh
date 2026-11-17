@@ -107,7 +107,10 @@ org site drive. Drive-qualified id:{drive_id}:{item_id} addresses still work.
 
 aifs_authenticate start returns the sign-in already in progress (under 10
 minutes old); pass force:true to start over. aifs_auth_status reports
-bootstrap (ready | needs_auth | needs_setup) and member_hash from local state.
+bootstrap (ready | needs_auth | needs_setup) and member_hash from local state;
+needs_setup means no member workspace on this install. If the signed-in
+account isn't the agent-index email, identity_match is false and member_hash
+is the install's only workspace (null if several: use the agent-index email).
 aifs_delete refuses an org root itself (PROTECTED_ORG_PATH).
 
 Environment: AIFS_CONFIG_PATH (path to agent-index.json, auto-discovered if not set)

@@ -185,8 +185,11 @@ async function routeToolCall(adapter, toolName, args, ctx = {}) {
       return {
         ...status,
         bootstrap: b.bootstrap,
-        ...(b.member_hash ? { member_hash: b.member_hash } : {}),
+        ...(b.member_hash !== undefined ? { member_hash: b.member_hash } : {}),
         ...(b.reason ? { bootstrap_reason: b.reason } : {}),
+        // finding 108: the signed-in account isn't always the agent-index email
+        ...(b.identity_match === false ? { identity_match: false, signed_in_hash: b.signed_in_hash } : {}),
+        ...(b.local_member_hashes ? { local_member_hashes: b.local_member_hashes } : {}),
       };
     }
 
@@ -355,7 +358,7 @@ async function main() {
         'Paths: absolute paths address the org SharePoint library; id:{item_id} is your own OneDrive (retried once on the site library if not found); id:{drive_id}:{item_id} is that drive. aifs_search scope takes a path or an id: anchor.',
         'Org locations are addressed by plain path: /org-config.json, /members-registry.json, /shared/..., /{collection}/... The executor finds them from org-config on the org site drive (2.8.0). Drive-qualified id:{drive_id}:{item_id} addresses still work and pass through unchanged.',
         'aifs_authenticate {action?: "start"|"complete", auth_code?, force?}: start returns the sign-in already in progress (under 10 minutes old) instead of a new link; pass force:true to start over.',
-        'aifs_auth_status also returns bootstrap: ready | needs_auth | needs_setup, from local files only.',
+        'aifs_auth_status also returns bootstrap: ready | needs_auth | needs_setup, from local files only. needs_setup means no member workspace on this install; when the signed-in account (e.g. a Microsoft UPN) is not the agent-index email, identity_match is false and member_hash is the only local workspace (null if there are several: resolve from the member\'s agent-index email).',
       ],
     }, null, 2));
     process.exit(0);
