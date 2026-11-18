@@ -570,3 +570,68 @@ test('exec: aifs_get_permissions passes include_inherited through to getPermissi
   assert.match(block, /options\.includeInherited\s*=\s*args\.include_inherited/);
   assert.match(block, /getPermissions\(args\.path,\s*options\)/);
 });
+
+// ─── Credential-store lock and sign-in-replaced detection (bug 20261118-68dff8bf-143550-c1a2) ───
+
+import { credLockIsBreakable, CRED_PROC_NONCE } from './onedrive.js';
+import { writeFile as _wf } from 'node:fs/promises';
+
+async function credFixture(tokens) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'od-cred-'));
+  await _wf(path.join(dir, 'onedrive.json'), JSON.stringify(tokens));
+  return dir;
+}
+async function adapterOn(dir) {
+  const a = new OneDriveAdapter();
+  await a.initialize({ tenant_id: 't', client_id: 'c', site_id: 'S', drive_id: 'D' }, dir);
+  return a;
+}
+// Fake Microsoft token endpoint: each refresh token works once (it rotates), like Microsoft's.
+function rotatingTokenServer() {
+  const spent = new Set(); let n = 1; let calls = 0;
+  const fake = async (url, opts) => {
+    calls++;
+    const rt = new URLSearchParams(opts.body).get('refresh_token');
+    await new Promise((r) => setTimeout(r, 50)); // a slow network makes the race real
+    if (spent.has(rt)) return { ok: false, json: async () => ({ error: 'invalid_grant', error_description: 'AADSTS70000: grant used' }) };
+    spent.add(rt); n++;
+    return { ok: true, json: async () => ({ access_token: `a${n}`, refresh_token: `r${n}`, expires_in: 3600 }) };
+  };
+  return { fake, calls: () => calls };
+}
+
+test('credential lock (bug c1a2): two refreshes at once spend the refresh token once, and both end signed in', async () => {
+  const dir = await credFixture({ access_token: 'a1', refresh_token: 'r1', expires_at: Date.now() - 1000 });
+  const srv = rotatingTokenServer(); const real = globalThis.fetch; globalThis.fetch = srv.fake;
+  try {
+    const [x, y] = [await adapterOn(dir), await adapterOn(dir)];
+    await Promise.all([x._refreshToken(), y._refreshToken()]);
+    assert.equal(srv.calls(), 1, 'the second process must reuse the first one\'s refresh, not spend r1 again');
+    assert.equal(x.tokens.refresh_token, 'r2'); assert.equal(y.tokens.refresh_token, 'r2');
+    assert.equal(JSON.parse(await readFile(path.join(dir, 'onedrive.json'), 'utf-8')).refresh_token, 'r2');
+    const lock = JSON.parse(await readFile(path.join(dir, 'onedrive.json.lock'), 'utf-8'));
+    assert.equal(lock.released, true, 'the lock is released afterwards');
+  } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
+});
+
+test('sign-in replaced (bug c1a2): invalid_grant is NOT_AUTHENTICATED with reason sign_in_replaced and a plain message', async () => {
+  const dir = await credFixture({ access_token: 'a1', refresh_token: 'stale', expires_at: Date.now() - 1000 });
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: 'invalid_grant' }) });
+  try {
+    const a = await adapterOn(dir);
+    await assert.rejects(() => a._refreshToken(), (e) => e.code === 'NOT_AUTHENTICATED' && e.details.reason === 'sign_in_replaced'
+      && /sign in again/i.test(e.message) && /Never copy your sign-in/.test(e.message));
+    const st = await a.getAuthStatus();
+    assert.equal(st.authenticated, false); assert.equal(st.reason, 'sign_in_replaced');
+  } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
+});
+
+test('credential lock (bug c1a2): released, dead-PID and stale locks can be taken over; a live fresh one cannot', () => {
+  const now = Date.now();
+  assert.equal(credLockIsBreakable({ released: true }, now), true);
+  assert.equal(credLockIsBreakable({ pid: 2 ** 22 + 12345, nonce: 'x', ts: now }, now), true, 'dead pid');
+  assert.equal(credLockIsBreakable({ pid: process.pid, nonce: 'other', ts: now }, now), true, 'our pid, another process\'s nonce');
+  assert.equal(credLockIsBreakable({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: now - 60_000 }, now), true, 'stale');
+  assert.equal(credLockIsBreakable({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: now }, now), false, 'live and fresh');
+});

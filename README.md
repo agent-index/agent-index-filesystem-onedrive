@@ -36,6 +36,12 @@ Set by the org admin during `create-org`:
 - **Share errors:** `EXTERNAL_SHARE_BLOCKED` means the tenant or site sharing policy doesn't allow sharing outside the organization. Graph's own text is in `reason`, plus `graph_status` and `graph_code`. When Graph gives only a generic refusal (`sharingFailed` / "There was a problem sharing…") with no policy wording, the error also carries `policy_inferred: true` and its message says the external-sharing setting is the usual cause rather than a certain one (`policy_inferred` is `false` when Graph names the policy). `INVALID_SUBJECT` is used only for a malformed address or a tenant recipient that doesn't resolve. Any other failure is `BACKEND_ERROR` or `ACCESS_DENIED`, with Graph's status, error code, and message included.
 - **`aifs_get_permissions` `inherited_from`** is filled from Graph's `inheritedFrom` (a known path, a logical path, or `id:{driveId}:{itemId}`) when Graph reports it. OneDrive and SharePoint often leave it out, for example for access through site membership. In that case it is `null`, which does not prove the grant is direct.
 
+## Credentials stay on the member's device
+
+- The member's sign-in lives in `.agent-index/credentials/onedrive.json` on their own computer. Only this executor reads it, and only when it runs on that computer. Never copy, read, upload or stage that folder anywhere else, and never run `aifs-exec` with a member's credentials in a cloud container or on another machine. If the executor can't run in a session, stop (core CLAUDE.md § "Important Constraints" and § "Bootstrap Protocol"; bug `20261118-68dff8bf-143550-c1a2`).
+- **The refresh token rotates.** Every refresh returns a new refresh token and the old one stops working. A refresh therefore runs under a lock file (`onedrive.json.lock`, released by overwriting it with a `released` marker), and re-reads the store after taking the lock, so two processes on the same computer never spend the same token.
+- **`NOT_AUTHENTICATED` with `reason: "sign_in_replaced"`** means Microsoft rejected the stored refresh token (`invalid_grant`): it was already used somewhere else, or it was revoked or expired. The member signs in again on this computer (`@ai:member-bootstrap`). `aifs_auth_status` reports the same reason.
+
 ## Development
 
 ```bash

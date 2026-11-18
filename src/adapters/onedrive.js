@@ -1,6 +1,7 @@
-import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, open } from 'node:fs/promises';
+import { writeFileSync as fsWriteFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
   AifsError,
@@ -28,6 +29,48 @@ import {
  * (sharingFailed / "problem sharing") with no policy wording — the policy is
  * the likely cause, not a certain one, so callers word it as "usually".
  */
+// ─── Credential-store lock (bug 20261118-68dff8bf-143550-c1a2) ─────────
+//
+// The OneDrive refresh token rotates on every refresh: Microsoft returns a new one and the old one
+// stops working. Two exec processes refreshing at once could each spend the same token and leave a
+// dead one on disk. So a refresh runs under a lock file beside the credential file, and re-reads
+// the store after taking it: if another process already refreshed, its tokens are used as they are.
+// Same scheme as the gdrive adapter's path locks (proven in Cowork): atomic create, release by
+// overwriting with a "released" marker (Cowork blocks unlink), PID + per-process nonce.
+const CRED_LOCK_STALE_MS = 30_000;
+const CRED_LOCK_POLL_MS = 100;
+const CRED_LOCK_TIMEOUT_MS = 30_000;
+export const CRED_PROC_NONCE = randomUUID();
+const _heldCredLocks = new Set();
+let _credExitHandler = false;
+
+function _credPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/** Whether a credential lock may be taken over: released, left by a dead process, or stale. */
+export function credLockIsBreakable(info, now = Date.now()) {
+  if (!info || typeof info !== 'object') return true;
+  if (info.released === true) return true;
+  if (info.pid === process.pid && info.nonce !== CRED_PROC_NONCE) return true;
+  if (typeof info.pid === 'number' && info.pid !== process.pid && !_credPidAlive(info.pid)) return true;
+  if (typeof info.ts !== 'number' || now - info.ts > CRED_LOCK_STALE_MS) return true;
+  return false;
+}
+
+function _credReleaseMarker() {
+  return JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: Date.now(), released: true });
+}
+
+function _installCredExitHandler() {
+  if (_credExitHandler) return;
+  _credExitHandler = true;
+  process.on('exit', () => {
+    for (const f of _heldCredLocks) { try { fsWriteFileSync(f, _credReleaseMarker()); } catch { /* best effort */ } }
+    _heldCredLocks.clear();
+  });
+}
+
 export class ExternalShareBlockedError extends AifsError {
   constructor(subject, path, graph = {}, opts = {}) {
     const inferred = opts.policyInferred === true;
@@ -203,7 +246,11 @@ export class OneDriveAdapter {
             user_identity: await this._getUserEmail(),
             expires_at: new Date(this.tokens.expires_at).toISOString(),
           };
-        } catch {
+        } catch (e) {
+          // Keep the specific reason when the stored sign-in was replaced (bug c1a2).
+          if (e && e.details && e.details.reason === 'sign_in_replaced') {
+            return { authenticated: false, ...base, reason: 'sign_in_replaced', detail: e.message };
+          }
           return { authenticated: false, ...base, reason: 'expired' };
         }
       }
@@ -1553,32 +1600,87 @@ export class OneDriveAdapter {
   }
 
   async _refreshToken() {
-    const tenant = this.connection.tenant_id;
-    const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-    const body = new URLSearchParams({
-      client_id: this.connection.client_id,
-      grant_type: 'refresh_token',
-      refresh_token: this.tokens.refresh_token,
-      scope: SCOPES,
+    // Under the credential lock: re-read the store first, because another process may already
+    // have rotated the refresh token (bug c1a2). Only refresh if the stored token still needs it.
+    await this._withCredentialLock(async () => {
+      try {
+        const onDisk = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
+        if (onDisk && onDisk.access_token) this.tokens = onDisk;
+      } catch { /* missing or unreadable: keep what we have */ }
+      if (this.tokens && this.tokens.access_token && this.tokens.expires_at &&
+          (this.tokens.expires_at - 300_000) >= Date.now()) {
+        return; // another process refreshed while we waited
+      }
+      if (!this.tokens || !this.tokens.refresh_token) throw new NotAuthenticatedError('expired');
+      const tenant = this.connection.tenant_id;
+      const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+      const body = new URLSearchParams({
+        client_id: this.connection.client_id,
+        grant_type: 'refresh_token',
+        refresh_token: this.tokens.refresh_token,
+        scope: SCOPES,
+      });
+      const res = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        // invalid_grant: the stored refresh token was already spent or revoked, e.g. rotated by
+        // a copy of this sign-in used somewhere else. Say so plainly (bug c1a2).
+        if (err.error === 'invalid_grant') {
+          const e = new NotAuthenticatedError('sign_in_replaced');
+          e.message = 'Not authenticated: sign_in_replaced. Your saved agent-index sign-in was replaced or has expired '
+            + '(for example, it was used somewhere else). Sign in again on this computer with @ai:member-bootstrap. '
+            + 'Never copy your sign-in to another machine.';
+          throw e;
+        }
+        throw new NotAuthenticatedError(
+          `Token refresh failed: ${err.error_description || err.error || 'unknown error'}`
+        );
+      }
+      const data = await res.json();
+      this.tokens = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || this.tokens.refresh_token,
+        expires_at: Date.now() + data.expires_in * 1000,
+      };
+      await this._writeCredential(this.tokens);
     });
-    const res = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body.toString(),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new NotAuthenticatedError(
-        `Token refresh failed: ${err.error_description || err.error || 'unknown error'}`
-      );
+  }
+
+  /** Run fn while holding the credential-store lock (bug c1a2). */
+  async _withCredentialLock(fn) {
+    const lockFile = `${this.credentialPath}.lock`;
+    await mkdir(dirname(lockFile), { recursive: true });
+    _installCredExitHandler();
+    const deadline = Date.now() + CRED_LOCK_TIMEOUT_MS;
+    let held = false;
+    while (!held) {
+      if (Date.now() > deadline) {
+        throw new BackendError(`Timed out waiting for the credential-store lock (${lockFile})`);
+      }
+      const claim = JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: Date.now() });
+      try {
+        const fh = await open(lockFile, 'wx');
+        await fh.writeFile(claim); await fh.close();
+        held = true; break;
+      } catch (e) { if (e.code !== 'EEXIST') throw e; }
+      let breakable;
+      try { breakable = credLockIsBreakable(JSON.parse(await readFile(lockFile, 'utf-8'))); } catch { breakable = true; }
+      if (breakable) {
+        try { await writeFile(lockFile, claim); held = true; break; } catch { continue; }
+      }
+      await new Promise((r) => setTimeout(r, CRED_LOCK_POLL_MS));
     }
-    const data = await res.json();
-    this.tokens = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || this.tokens.refresh_token,
-      expires_at: Date.now() + data.expires_in * 1000,
-    };
-    await this._writeCredential(this.tokens);
+    _heldCredLocks.add(lockFile);
+    try {
+      return await fn();
+    } finally {
+      _heldCredLocks.delete(lockFile);
+      try { await writeFile(lockFile, _credReleaseMarker()); } catch { /* harmless */ }
+    }
   }
 
   async _getUserEmail() {
