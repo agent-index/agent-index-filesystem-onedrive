@@ -195,6 +195,42 @@ test('startAuth REUSES a still-fresh persisted verifier (pkcerestart — re-issu
   }
 });
 
+test('_clearVerifier: a delete the mount refuses still leaves no usable verifier (finding 116)', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-clear-'));
+  const a = new OneDriveAdapter();
+  try {
+    await a.initialize({ tenant_id: 'T-CLR', client_id: 'C-CLR' }, dir);
+    const r1 = await a.startAuth();
+    const ch1 = new URL(r1.auth_url).searchParams.get('code_challenge');
+    a._removeFile = async () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); };
+    await a._clearVerifier();
+    assert.equal(await a._readVerifier(), null, 'no verifier after a refused delete');
+    const r2 = await a.startAuth();
+    assert.notEqual(new URL(r2.auth_url).searchParams.get('code_challenge'), ch1, 'a new challenge after clearing');
+  } finally {
+    a._removeFile = null; await a._clearVerifier(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('startAuth({fresh:true}) never reuses a fresh verifier (force, finding 116)', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-fresh-'));
+  const a = new OneDriveAdapter();
+  try {
+    await a.initialize({ tenant_id: 'T-FR', client_id: 'C-FR' }, dir);
+    const r1 = await a.startAuth();
+    const r2 = await a.startAuth({ fresh: true });
+    const c1 = new URL(r1.auth_url).searchParams.get('code_challenge');
+    const c2 = new URL(r2.auth_url).searchParams.get('code_challenge');
+    assert.notEqual(c1, c2);
+    assert.doesNotMatch(r2.message, /already in progress|resuming/i);
+    // and the new verifier is what complete would use
+    const v = await a._readVerifier();
+    assert.ok(v.code_verifier && v.created > 0);
+  } finally {
+    await a._clearVerifier(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('resolveIdentity: requires auth, rejects empty ref', async () => {
   const a = makeAdapter();
   a.tokens = null;
@@ -569,4 +605,21 @@ test('exec: aifs_get_permissions passes include_inherited through to getPermissi
   assert.match(block, /hasOwnProperty\.call\(args,\s*'include_inherited'\)/);
   assert.match(block, /options\.includeInherited\s*=\s*args\.include_inherited/);
   assert.match(block, /getPermissions\(args\.path,\s*options\)/);
+});
+
+test('the /tmp PKCE copy is per install, not per tenant (finding 116)', async () => {
+  const d1 = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-i1-'));
+  const d2 = await mkdtemp(path.join(os.tmpdir(), 'od-pkce-i2-'));
+  const a = new OneDriveAdapter(); const b = new OneDriveAdapter();
+  try {
+    await a.initialize({ tenant_id: 'T-SAME', client_id: 'C-SAME' }, d1);
+    await b.initialize({ tenant_id: 'T-SAME', client_id: 'C-SAME' }, d2);
+    assert.notEqual(a.pkceTmpPath, b.pkceTmpPath);
+    const ra = await a.startAuth();
+    const rb = await b.startAuth();
+    assert.notEqual(new URL(ra.auth_url).searchParams.get('code_challenge'), new URL(rb.auth_url).searchParams.get('code_challenge'));
+  } finally {
+    await a._clearVerifier(); await b._clearVerifier();
+    await rm(d1, { recursive: true, force: true }); await rm(d2, { recursive: true, force: true });
+  }
 });
