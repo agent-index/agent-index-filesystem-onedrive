@@ -65,6 +65,6 @@
   "node_min_version": "18.0.0",
   "exec_bundle_entry": "dist/aifs-exec.bundle.js",
   "exec_shell_wrapper": "dist/aifs-exec.sh",
-  "bundle_built_at": "2026-11-18T13:42:58.588Z",
-  "exec_bundle_checksum": "sha256:006c0dd16f833ffc3b87b817bd060ccd971aaa0a35108766f380b8f52fa71815"
+  "bundle_built_at": "2026-11-18T14:27:57.964Z",
+  "exec_bundle_checksum": "sha256:638ea458e0165f05cbee842172eaf41c11a8b4e945885ed82ea2766bac9970cb"
 }

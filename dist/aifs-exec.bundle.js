@@ -37679,6 +37679,12 @@ function pathArgs(toolName, args) {
 function needsOrgMap(toolName, args) {
   return pathArgs(toolName, args).some((p) => firstSegment(p) !== null);
 }
+function hasBareIdAnchor(toolName, args) {
+  return pathArgs(toolName, args).some((p) => {
+    const m = /^id:([^/:]+)(\/|$)/.exec(p);
+    return !!m && !/^(root|approot|special)$/i.test(m[1]);
+  });
+}
 function sharedPrefixFrom(orgConfig) {
   const raw = orgConfig?.paths?.shared_root;
   if (typeof raw === "string" && raw.trim().startsWith("/")) {
@@ -37819,9 +37825,12 @@ function orgConfigAddress(config2) {
     return conn.org_config_id ? `id:${conn.org_config_id}` : null;
   return "/org-config.json";
 }
-async function orgConfigRevision(adapter, address) {
+async function orgConfigStat(adapter, address) {
   const st = await adapter.stat(address);
-  return st?.revision ?? null;
+  return { revision: st?.revision ?? null, id: st?.id ?? null };
+}
+async function orgConfigRevision(adapter, address) {
+  return (await orgConfigStat(adapter, address)).revision;
 }
 var NOT_VISIBLE_CODES = /* @__PURE__ */ new Set(["FILE_NOT_FOUND", "PATH_NOT_FOUND", "ACCESS_DENIED"]);
 async function validatePrefixes(adapter, config2, prefixes, dropped, warn) {
@@ -37872,8 +37881,9 @@ async function build(ctx) {
   if (!address)
     return { map: null, reason: "no_org_config_id" };
   let revision = null;
+  let orgConfigItemId = null;
   try {
-    revision = await orgConfigRevision(adapter, address);
+    ({ revision, id: orgConfigItemId } = await orgConfigStat(adapter, address));
   } catch (err) {
     return { map: null, reason: `org_config_unreadable:${err?.code || err?.message || "error"}` };
   }
@@ -37885,7 +37895,7 @@ async function build(ctx) {
     return { map: null, reason: `org_config_unreadable:${err?.code || "parse_error"}` };
   }
   const id = identity(config2);
-  const { prefixes, shared_prefix, dropped } = buildPrefixes(orgConfig, { orgConfigId: id.org_config_id });
+  const { prefixes, shared_prefix, dropped } = buildPrefixes(orgConfig, { orgConfigId: id.org_config_id || orgConfigItemId });
   for (const d of dropped)
     warn(`aifs: org map: dropped collection "${d.name}" (${d.reason})`);
   const { prefixes: validated, complete } = await validatePrefixes(adapter, config2, prefixes, dropped, warn);
@@ -37912,7 +37922,7 @@ async function resolveOrgMap({ config: config2, adapter, credentialStore, mode =
       }
       if (r.map && r.persist)
         await saveOrgMap(credentialStore, r.map);
-      return { map: r.map, reason: r.reason, rebuilt: !!r.map };
+      return { map: r.map, reason: r.reason, rebuilt: !!r.map, persist: !!(r.map && r.persist) };
     }
     if (mode === "normal")
       return { map: cached2, reason: null, rebuilt: false };
@@ -37937,7 +37947,7 @@ async function resolveOrgMap({ config: config2, adapter, credentialStore, mode =
         }
         if (r.persist)
           await saveOrgMap(credentialStore, r.map);
-        return { map: r.map, reason: null, rebuilt: true };
+        return { map: r.map, reason: null, rebuilt: true, persist: !!r.persist };
       }
       return { map: cached2, reason: null, rebuilt: false };
     }
@@ -39170,6 +39180,33 @@ var OneDriveAdapter = class {
     }
     const ncLower = nameContains ? String(nameContains).toLowerCase() : null;
     const results = [];
+    const scopePath = isRoot ? "" : norm.replace(/\/$/, "");
+    const folderPath = /* @__PURE__ */ new Map();
+    if (scopeId)
+      folderPath.set(scopeId, scopePath);
+    const pathOfFolder = async (id, depth = 0) => {
+      if (!id)
+        return null;
+      if (folderPath.has(id))
+        return folderPath.get(id);
+      if (depth > 32)
+        return null;
+      let out = null;
+      try {
+        const res = await this._graph(`${base}/items/${id}?$select=id,name,root,parentReference`);
+        const d = await res.json();
+        if (d.root)
+          out = isRoot ? "" : null;
+        else {
+          const up = await pathOfFolder(d.parentReference?.id, depth + 1);
+          out = up === null ? null : `${up}/${d.name}`;
+        }
+      } catch {
+        out = null;
+      }
+      folderPath.set(id, out);
+      return out;
+    };
     for (const f of items) {
       const isFolder = !!f.folder;
       if (type === "folder" && !isFolder)
@@ -39190,12 +39227,18 @@ var OneDriveAdapter = class {
         })() : null;
         if (!this._isAnchor(scope) && parentPath !== null && (parentPath === "" || parentPath.startsWith("/"))) {
           p = `${parentPath.replace(/\/$/, "")}/${f.name}`;
+        } else if (nameContains && f.parentReference?.id) {
+          const up = await pathOfFolder(f.parentReference.id);
+          p = up === null ? null : `${up}/${f.name}`;
         } else {
           p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
         }
       }
+      if (p === null)
+        continue;
       results.push({
         path: p,
+        id: f.id,
         type: isFolder ? "folder" : "file",
         name: f.name,
         owner: f.createdBy?.user?.email || f.createdBy?.user?.displayName || null,
@@ -40077,11 +40120,13 @@ async function main() {
   };
   let orgMap = null;
   let orgMapReason = null;
-  if (needsOrgMap(toolName, toolArgs)) {
+  if (needsOrgMap(toolName, toolArgs) || hasBareIdAnchor(toolName, toolArgs)) {
     try {
       const ctx = { config: config2, adapter, credentialStore, warn };
       let r = await resolveOrgMap(ctx);
       orgMap = r.map;
+      if (VERBOSE && orgMap)
+        warn(`aifs: org map: ${r.rebuilt ? "built from org-config" + (r.persist === false ? " (not saved: a check failed transiently)" : " and saved") : "from the saved file"} (${Object.keys(orgMap.prefixes || {}).length} prefixes)`);
       if (!orgMap) {
         orgMapReason = r.reason;
         warn(`aifs: org map unavailable (${r.reason}); paths resolved without it`);
