@@ -93,3 +93,39 @@ test('search: a nested hit from a recursive name search carries its full path', 
   const paths = out.results.map((r) => r.path).sort();
   assert.deepEqual(paths, ['/shared/projects/a/b/deep.md', '/shared/projects/top.md']);
 });
+
+test('search: nested hits without parentReference.path get their full path by walking parent ids (B15)', async () => {
+  const a = makeAdapter();
+  a._resolveItemId = async () => 'SCOPE';
+  const calls = mockGraph(a, (url) => {
+    if (url.includes('/search(')) {
+      return { body: { value: [
+        { id: 'F1', name: 'update-log.json', file: {}, parentReference: { id: 'UPD', driveId: 'D' } },
+        { id: 'F2', name: 'manifest.json', file: {}, parentReference: { id: 'DIST', driveId: 'D' } },
+        { id: 'F3', name: 'README.md', file: {}, parentReference: { id: 'A' } },
+        { id: 'F4', name: 'README.md', file: {}, parentReference: { id: 'B' } },
+        { id: 'F5', name: 'top.json', file: {}, parentReference: { id: 'SCOPE' } },
+        { id: 'F6', name: 'stray.json', file: {}, parentReference: { id: 'ELSEWHERE' } },
+      ] } };
+    }
+    const item = (id, name, parent) => ({ body: { id, name, parentReference: { id: parent } } });
+    if (url.includes('/items/UPD?')) return item('UPD', 'updates', 'SCOPE');
+    if (url.includes('/items/DIST?')) return item('DIST', 'dist', 'SCOPE');
+    if (url.includes('/items/A?')) return item('A', 'a', 'P');
+    if (url.includes('/items/B?')) return item('B', 'b', 'P');
+    if (url.includes('/items/P?')) return item('P', 'projects', 'SCOPE');
+    if (url.includes('/items/ELSEWHERE?')) return { body: { id: 'ELSEWHERE', name: 'x', root: {} } };
+    return { status: 200, body: {} };
+  });
+  const out = await a.search({ scope: '/shared', name_contains: 'json' + '' });
+  const byId = Object.fromEntries(out.results.map((r) => [r.id, r.path]));
+  assert.equal(byId.F1, '/shared/updates/update-log.json');
+  assert.equal(byId.F2, '/shared/dist/manifest.json');
+  assert.equal(byId.F5, '/shared/top.json');
+  assert.equal(byId.F6, undefined, 'a hit that cannot be placed under the scope is left out');
+  const md = await a.search({ scope: '/shared', name_contains: 'README' });
+  assert.deepEqual(md.results.map((r) => r.path).sort(), ['/shared/projects/a/README.md', '/shared/projects/b/README.md']);
+  // each folder looked up at most once per search call
+  const pLookups = calls.filter((u) => u.includes('/items/P?')).length;
+  assert.ok(pLookups <= 2, `P looked up ${pLookups} times across two searches`);
+});
