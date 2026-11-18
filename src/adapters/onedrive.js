@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rm, open } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm, open, stat } from 'node:fs/promises';
 import { writeFileSync as fsWriteFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes, createHash, randomUUID } from 'node:crypto';
@@ -35,11 +35,24 @@ import {
 // stops working. Two exec processes refreshing at once could each spend the same token and leave a
 // dead one on disk. So a refresh runs under a lock file beside the credential file, and re-reads
 // the store after taking it: if another process already refreshed, its tokens are used as they are.
-// Same scheme as the gdrive adapter's path locks (proven in Cowork): atomic create, release by
-// overwriting with a "released" marker (Cowork blocks unlink), PID + per-process nonce.
+// Atomic create when no lock file exists; release by overwriting with a "released" marker (Cowork
+// blocks unlink); PID + per-process nonce. Taking over a released, dead or stale lock is an
+// overwrite, which is NOT atomic: two processes can both see "released" and both write. So a
+// takeover writes a claim with a unique ticket, waits CRED_LOCK_CONFIRM_MS, re-reads, and holds the
+// lock only if its own ticket is still there; otherwise it goes back to waiting (Bill's review).
 const CRED_LOCK_STALE_MS = 30_000;
 const CRED_LOCK_POLL_MS = 100;
+const CRED_LOCK_CONFIRM_MS = 150;
 const CRED_LOCK_TIMEOUT_MS = 30_000;
+
+/** Raised when the credential lock can't be taken in time. Not a sign-in problem (bug c1a2). */
+export class CredentialLockBusyError extends BackendError {
+  constructor(lockFile) {
+    super(`Timed out waiting for the credential-store lock (${lockFile}). Another agent-index process `
+      + 'on this computer is refreshing your sign-in. Try again in a moment; you do not need to sign in again.');
+    this.details = { ...(this.details || {}), reason: 'credential_lock_busy', needs_auth: false };
+  }
+}
 export const CRED_PROC_NONCE = randomUUID();
 const _heldCredLocks = new Set();
 let _credExitHandler = false;
@@ -247,9 +260,14 @@ export class OneDriveAdapter {
             expires_at: new Date(this.tokens.expires_at).toISOString(),
           };
         } catch (e) {
-          // Keep the specific reason when the stored sign-in was replaced (bug c1a2).
-          if (e && e.details && e.details.reason === 'sign_in_replaced') {
-            return { authenticated: false, ...base, reason: 'sign_in_replaced', detail: e.message };
+          // A busy credential lock is not a sign-in problem: never report it as expired, and say
+          // needs_auth: false so the session doesn't re-authenticate (bug c1a2 review).
+          if (e instanceof CredentialLockBusyError) {
+            return { authenticated: false, ...base, reason: 'credential_lock_busy', needs_auth: false, detail: e.message };
+          }
+          // A rejected refresh token (invalid_grant) is 'expired', with the plain message (bug c1a2).
+          if (e && e.details && e.details.reason === 'expired' && e.details.refresh_detail) {
+            return { authenticated: false, ...base, reason: 'expired', detail: e.message };
           }
           return { authenticated: false, ...base, reason: 'expired' };
         }
@@ -1602,13 +1620,17 @@ export class OneDriveAdapter {
   async _refreshToken() {
     // Under the credential lock: re-read the store first, because another process may already
     // have rotated the refresh token (bug c1a2). Only refresh if the stored token still needs it.
+    // Skip the refresh only when another process saved a DIFFERENT, still-valid token while we
+    // waited. If the token on disk is the one this process already held, refresh anyway: that
+    // token may have been rejected (e.g. a refresh after a 401), not merely expired (bug c1a2 review).
+    const heldAccessToken = this.tokens ? this.tokens.access_token : undefined;
     await this._withCredentialLock(async () => {
       try {
         const onDisk = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
         if (onDisk && onDisk.access_token) this.tokens = onDisk;
       } catch { /* missing or unreadable: keep what we have */ }
-      if (this.tokens && this.tokens.access_token && this.tokens.expires_at &&
-          (this.tokens.expires_at - 300_000) >= Date.now()) {
+      if (this.tokens && this.tokens.access_token && this.tokens.access_token !== heldAccessToken
+          && this.tokens.expires_at && (this.tokens.expires_at - 300_000) >= Date.now()) {
         return; // another process refreshed while we waited
       }
       if (!this.tokens || !this.tokens.refresh_token) throw new NotAuthenticatedError('expired');
@@ -1630,10 +1652,11 @@ export class OneDriveAdapter {
         // invalid_grant: the stored refresh token was already spent or revoked, e.g. rotated by
         // a copy of this sign-in used somewhere else. Say so plainly (bug c1a2).
         if (err.error === 'invalid_grant') {
-          const e = new NotAuthenticatedError('sign_in_replaced');
-          e.message = 'Not authenticated: sign_in_replaced. Your saved agent-index sign-in was replaced or has expired '
-            + '(for example, it was used somewhere else). Sign in again on this computer with @ai:member-bootstrap. '
-            + 'Never copy your sign-in to another machine.';
+          const e = new NotAuthenticatedError('expired');
+          e.message = 'Not authenticated: expired. Microsoft rejected your saved agent-index sign-in. It was probably '
+            + 'replaced (for example, used somewhere else) or revoked. Sign in again on this computer with '
+            + '@ai:member-bootstrap. Never copy your sign-in to another machine.';
+          e.details.refresh_detail = `Microsoft: ${err.error}${err.error_codes ? ` (AADSTS${err.error_codes[0]})` : ''}`;
           throw e;
         }
         throw new NotAuthenticatedError(
@@ -1655,24 +1678,34 @@ export class OneDriveAdapter {
     const lockFile = `${this.credentialPath}.lock`;
     await mkdir(dirname(lockFile), { recursive: true });
     _installCredExitHandler();
-    const deadline = Date.now() + CRED_LOCK_TIMEOUT_MS;
+    const deadline = Date.now() + (this._credLockTimeoutMs || CRED_LOCK_TIMEOUT_MS); // overridable in tests
     let held = false;
     while (!held) {
-      if (Date.now() > deadline) {
-        throw new BackendError(`Timed out waiting for the credential-store lock (${lockFile})`);
-      }
-      const claim = JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: Date.now() });
+      if (Date.now() > deadline) throw new CredentialLockBusyError(lockFile);
+      const ticket = randomUUID();
+      const claim = JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ticket, ts: Date.now() });
       try {
         const fh = await open(lockFile, 'wx');
         await fh.writeFile(claim); await fh.close();
         held = true; break;
       } catch (e) { if (e.code !== 'EEXIST') throw e; }
       let breakable;
-      try { breakable = credLockIsBreakable(JSON.parse(await readFile(lockFile, 'utf-8'))); } catch { breakable = true; }
-      if (breakable) {
-        try { await writeFile(lockFile, claim); held = true; break; } catch { continue; }
+      try {
+        breakable = credLockIsBreakable(JSON.parse(await readFile(lockFile, 'utf-8')));
+      } catch {
+        // Unreadable or empty: possibly a claim being written right now. Only take it over if the
+        // file hasn't changed for longer than the stale window.
+        try { breakable = (Date.now() - (await stat(lockFile)).mtimeMs) > CRED_LOCK_STALE_MS; } catch { breakable = false; }
       }
-      await new Promise((r) => setTimeout(r, CRED_LOCK_POLL_MS));
+      if (breakable) {
+        try {
+          await writeFile(lockFile, claim);
+          await new Promise((r) => setTimeout(r, CRED_LOCK_CONFIRM_MS));
+          const now = JSON.parse(await readFile(lockFile, 'utf-8'));
+          if (now && now.ticket === ticket) { held = true; break; }
+        } catch { /* lost the race or unreadable: wait and try again */ }
+      }
+      await new Promise((r) => setTimeout(r, CRED_LOCK_POLL_MS + Math.floor(Math.random() * 50)));
     }
     _heldCredLocks.add(lockFile);
     try {

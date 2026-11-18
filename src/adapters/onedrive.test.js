@@ -571,9 +571,9 @@ test('exec: aifs_get_permissions passes include_inherited through to getPermissi
   assert.match(block, /getPermissions\(args\.path,\s*options\)/);
 });
 
-// ─── Credential-store lock and sign-in-replaced detection (bug 20261118-68dff8bf-143550-c1a2) ───
+// ─── Credential-store lock and rejected-sign-in detection (bug 20261118-68dff8bf-143550-c1a2) ───
 
-import { credLockIsBreakable, CRED_PROC_NONCE } from './onedrive.js';
+import { credLockIsBreakable, CRED_PROC_NONCE, CredentialLockBusyError } from './onedrive.js';
 import { writeFile as _wf } from 'node:fs/promises';
 
 async function credFixture(tokens) {
@@ -614,18 +614,101 @@ test('credential lock (bug c1a2): two refreshes at once spend the refresh token 
   } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
 });
 
-test('sign-in replaced (bug c1a2): invalid_grant is NOT_AUTHENTICATED with reason sign_in_replaced and a plain message', async () => {
+test('rejected sign-in (bug c1a2): invalid_grant is NOT_AUTHENTICATED with reason expired and a plain message', async () => {
   const dir = await credFixture({ access_token: 'a1', refresh_token: 'stale', expires_at: Date.now() - 1000 });
   const real = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: 'invalid_grant' }) });
+  globalThis.fetch = async () => ({ ok: false, json: async () => ({ error: 'invalid_grant', error_codes: [70000] }) });
   try {
     const a = await adapterOn(dir);
-    await assert.rejects(() => a._refreshToken(), (e) => e.code === 'NOT_AUTHENTICATED' && e.details.reason === 'sign_in_replaced'
-      && /sign in again/i.test(e.message) && /Never copy your sign-in/.test(e.message));
+    await assert.rejects(() => a._refreshToken(), (e) => e.code === 'NOT_AUTHENTICATED' && e.details.reason === 'expired'
+      && e.details.needs_auth === true && /probably\s+replaced/.test(e.message) && /sign in again/i.test(e.message)
+      && /Never copy your sign-in/.test(e.message) && /AADSTS70000/.test(e.details.refresh_detail));
     const st = await a.getAuthStatus();
-    assert.equal(st.authenticated, false); assert.equal(st.reason, 'sign_in_replaced');
+    assert.equal(st.authenticated, false); assert.equal(st.reason, 'expired'); assert.match(st.detail, /Sign in again/);
   } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
 });
+
+test('refresh skip (bug c1a2 review): refreshes when the token on disk is the one this process held; skips only for a different valid token', async () => {
+  const valid = Date.now() + 3600_000;
+  const srv = rotatingTokenServer(); const real = globalThis.fetch; globalThis.fetch = srv.fake;
+  const dir = await credFixture({ access_token: 'a1', refresh_token: 'r1', expires_at: valid });
+  try {
+    const a = await adapterOn(dir); // holds a1, which is also what is on disk (e.g. rejected with a 401)
+    await a._refreshToken();
+    assert.equal(srv.calls(), 1, 'the same token on disk must not count as "someone else refreshed"');
+    assert.notEqual(a.tokens.access_token, 'a1');
+    // Another process saved a different, valid token while we waited: use it, no new refresh.
+    const b = await adapterOn(dir); b.tokens = { ...b.tokens, access_token: 'old-held' };
+    await b._refreshToken();
+    assert.equal(srv.calls(), 1); assert.equal(b.tokens.access_token, a.tokens.access_token);
+  } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
+});
+
+test('lock busy (bug c1a2 review): a lock timeout is credential_lock_busy with needs_auth false, never expired', async () => {
+  const dir = await credFixture({ access_token: 'a1', refresh_token: 'r1', expires_at: Date.now() - 1000 });
+  const real = globalThis.fetch; let calls = 0; globalThis.fetch = async () => { calls++; return { ok: false, json: async () => ({}) }; };
+  try {
+    // A live, fresh lock held by this process's own nonce: not breakable.
+    await _wf(path.join(dir, 'onedrive.json.lock'), JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ticket: 'x', ts: Date.now() }));
+    const a = await adapterOn(dir); a._credLockTimeoutMs = 400;
+    const st = await a.getAuthStatus();
+    assert.equal(st.authenticated, false); assert.equal(st.reason, 'credential_lock_busy'); assert.equal(st.needs_auth, false);
+    assert.match(st.detail, /do not need to sign in again/); assert.equal(calls, 0, 'no refresh without the lock');
+    // An empty lock file that was just written (a claim in progress) is not taken over either.
+    await _wf(path.join(dir, 'onedrive.json.lock'), '');
+    await assert.rejects(() => a._refreshToken(), (e) => e instanceof CredentialLockBusyError);
+    assert.equal(calls, 0);
+  } finally { globalThis.fetch = real; await rm(dir, { recursive: true, force: true }); }
+});
+
+// Real separate processes (each with its own PID and nonce) racing for a lock that already exists as
+// "released" - the case where the old takeover could let two processes in (Bill's review).
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+
+for (const N of [3, 5]) {
+  test(`credential lock (bug c1a2 review): ${N} processes on an existing released lock refresh exactly once and all end signed in`, async () => {
+    const dir = await credFixture({ access_token: 'a1', refresh_token: 'r1', expires_at: Date.now() - 1000 });
+    await _wf(path.join(dir, 'onedrive.json.lock'), JSON.stringify({ pid: 1, nonce: 'gone', ts: Date.now(), released: true }));
+    const spent = new Set(); let n = 1; let calls = 0;
+    const server = createServer((req, res) => {
+      let body = ''; req.on('data', (c) => { body += c; });
+      req.on('end', () => setTimeout(() => {
+        calls++; const rt = new URLSearchParams(body).get('refresh_token');
+        res.setHeader('content-type', 'application/json');
+        if (spent.has(rt)) { res.statusCode = 400; res.end(JSON.stringify({ error: 'invalid_grant' })); return; }
+        spent.add(rt); n++; res.end(JSON.stringify({ access_token: `a${n}`, refresh_token: `r${n}`, expires_in: 3600 }));
+      }, 80));
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    const adapterUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), 'onedrive.js')).href;
+    const child = path.join(dir, 'child.mjs');
+    await _wf(child, `
+      const { OneDriveAdapter } = await import(${JSON.stringify(adapterUrl)});
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (url, opts) => String(url).includes('/oauth2/v2.0/token')
+        ? realFetch('http://127.0.0.1:${port}/token', opts) : realFetch(url, opts);
+      const a = new OneDriveAdapter();
+      await a.initialize({ tenant_id: 't', client_id: 'c', site_id: 'S', drive_id: 'D' }, ${JSON.stringify(dir)});
+      const start = Number(process.argv[2]); await new Promise((r) => setTimeout(r, Math.max(0, start - Date.now())));
+      try { await a._refreshToken(); console.log(JSON.stringify({ ok: true, rt: a.tokens.refresh_token })); }
+      catch (e) { console.log(JSON.stringify({ ok: false, err: e.message })); }
+    `);
+    try {
+      const start = Date.now() + 1500;
+      const results = await Promise.all(Array.from({ length: N }, () => new Promise((resolve) => {
+        const p = spawn(process.execPath, [child, String(start)]); let out = '';
+        p.stdout.on('data', (d) => { out += d; }); p.on('close', () => resolve(JSON.parse(out.trim().split('\n').pop())));
+      })));
+      assert.equal(calls, 1, `exactly one refresh across ${N} processes (got ${calls})`);
+      for (const r of results) { assert.equal(r.ok, true, r.err); assert.equal(r.rt, 'r2'); }
+      assert.equal(JSON.parse(await readFile(path.join(dir, 'onedrive.json'), 'utf-8')).refresh_token, 'r2');
+      assert.equal(JSON.parse(await readFile(path.join(dir, 'onedrive.json.lock'), 'utf-8')).released, true);
+    } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 test('credential lock (bug c1a2): released, dead-PID and stale locks can be taken over; a live fresh one cannot', () => {
   const now = Date.now();
