@@ -22,6 +22,7 @@ import {
   isProtectedOrgPath,
   missingSegments,
   needsOrgMap,
+  hasBareIdAnchor,
   IDEMPOTENT_TOOLS,
   readPendingAuth,
   writePendingAuth,
@@ -412,11 +413,14 @@ async function main() {
   const warn = (m) => { try { process.stderr.write(m + '\n'); } catch { /* ignore */ } };
   let orgMap = null;
   let orgMapReason = null;
-  if (needsOrgMap(toolName, toolArgs)) {
+  // A bare id: also loads the (normally saved) map, so org ids are seeded before the
+  // call and skip the own-drive probe (B14, technical design §2.6).
+  if (needsOrgMap(toolName, toolArgs) || hasBareIdAnchor(toolName, toolArgs)) {
     try {
       const ctx = { config, adapter, credentialStore, warn };
       let r = await resolveOrgMap(ctx);
       orgMap = r.map;
+      if (VERBOSE && orgMap) warn(`aifs: org map: ${r.rebuilt ? 'built from org-config' + (r.persist === false ? ' (not saved: a check failed transiently)' : ' and saved') : 'from the saved file'} (${Object.keys(orgMap.prefixes || {}).length} prefixes)`);
       if (!orgMap) {
         orgMapReason = r.reason;
         warn(`aifs: org map unavailable (${r.reason}); paths resolved without it`);

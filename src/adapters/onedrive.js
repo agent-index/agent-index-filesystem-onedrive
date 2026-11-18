@@ -1161,6 +1161,29 @@ export class OneDriveAdapter {
 
     const ncLower = nameContains ? String(nameContains).toLowerCase() : null;
     const results = [];
+    // B15 (CI-025): Graph search results usually carry parentReference.id but not
+    // parentReference.path, so a nested hit's folder is found by walking up from its
+    // parent id to the scope (one lookup per distinct folder, cached for this call).
+    const scopePath = isRoot ? '' : norm.replace(/\/$/, '');
+    const folderPath = new Map();
+    if (scopeId) folderPath.set(scopeId, scopePath);
+    const pathOfFolder = async (id, depth = 0) => {
+      if (!id) return null;
+      if (folderPath.has(id)) return folderPath.get(id);
+      if (depth > 32) return null;
+      let out = null;
+      try {
+        const res = await this._graph(`${base}/items/${id}?$select=id,name,root,parentReference`);
+        const d = await res.json();
+        if (d.root) out = isRoot ? '' : null; // the drive root, above a non-root scope
+        else {
+          const up = await pathOfFolder(d.parentReference?.id, depth + 1);
+          out = up === null ? null : `${up}/${d.name}`;
+        }
+      } catch { out = null; }
+      folderPath.set(id, out);
+      return out;
+    };
     for (const f of items) {
       const isFolder = !!f.folder;
       if (type === 'folder' && !isFolder) continue;
@@ -1177,12 +1200,17 @@ export class OneDriveAdapter {
           : null;
         if (!this._isAnchor(scope) && parentPath !== null && (parentPath === '' || parentPath.startsWith('/'))) {
           p = `${parentPath.replace(/\/$/, '')}/${f.name}`;
+        } else if (nameContains && f.parentReference?.id) {
+          const up = await pathOfFolder(f.parentReference.id);
+          p = up === null ? null : `${up}/${f.name}`;
         } else {
           p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
         }
       }
+      if (p === null) continue; // its folder couldn't be placed under the scope: never report a wrong path
       results.push({
         path: p,
+        id: f.id,
         type: isFolder ? 'folder' : 'file',
         name: f.name,
         owner: f.createdBy?.user?.email || f.createdBy?.user?.displayName || null,
