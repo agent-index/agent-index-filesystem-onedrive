@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
@@ -178,7 +178,9 @@ export class OneDriveAdapter {
     // fallback for environments where tmp isn't shared. Keyed by tenant+client
     // so concurrent installs in one sandbox don't collide. See startAuth/completeAuth.
     this.pkcePath = join(credentialStore, 'onedrive-pkce.json');
-    const pkceKey = createHash('sha256').update(`${connection.tenant_id}:${connection.client_id}`).digest('hex').slice(0, 16);
+    // Keyed by install too (finding 116): two installs on one tenant (an admin and a member)
+    // share a sandbox /tmp in Cowork and must not share a verifier.
+    const pkceKey = createHash('sha256').update(`${connection.tenant_id}:${connection.client_id}:${resolvePath(credentialStore)}`).digest('hex').slice(0, 16);
     this.pkceTmpPath = join(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
       this.tokens = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
@@ -266,14 +268,24 @@ export class OneDriveAdapter {
     return null;
   }
 
-  /** Remove the persisted verifier from all paths (post-completion cleanup). */
+  /** Remove the persisted verifier from all paths (post-completion cleanup).
+   *  The Cowork mount can refuse deletes (finding 83), so when a file survives the
+   *  delete it is overwritten with an empty, expired record that _readVerifier and
+   *  startAuth ignore (finding 116: a used verifier was being reused). */
   async _clearVerifier() {
+    const removeFile = this._removeFile || ((p) => rm(p, { force: true }));
     for (const p of this._pkcePaths()) {
-      try { await rm(p, { force: true }); } catch { /* */ }
+      try { await removeFile(p); } catch { /* fall through to the overwrite */ }
+      let survived = false;
+      try { await readFile(p, 'utf-8'); survived = true; } catch { /* gone */ }
+      if (survived) {
+        try { await writeFile(p, JSON.stringify({ code_verifier: null, created: 0 }), 'utf-8'); } catch { /* */ }
+      }
     }
+    this._codeVerifier = null;
   }
 
-  async startAuth() {
+  async startAuth({ fresh = false } = {}) {
     // pkcerestart (bug 20260615-8d20ea22-pkcerestart): TWO defenses.
     // (1) Persistence: write the verifier to a sandbox-local tmp path (primary)
     //     so it reliably survives between the separate start/complete exec
@@ -286,7 +298,8 @@ export class OneDriveAdapter {
     let reused = false;
     const existing = await this._readVerifier();
     const FRESH_MS = 10 * 60 * 1000;
-    if (existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
+    // fresh: a forced start (aifs_authenticate force:true) never reuses (finding 116).
+    if (!fresh && existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
       verifier = existing.code_verifier;
       reused = true;
     }

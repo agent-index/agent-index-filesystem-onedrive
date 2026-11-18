@@ -213,7 +213,7 @@ async function routeToolCall(adapter, toolName, args, ctx = {}) {
           if (pending && verifier?.code_verifier) return reusedAuthResponse(pending);
         }
         if (args.force && typeof adapter._clearVerifier === 'function') await adapter._clearVerifier();
-        const started = await adapter.startAuth();
+        const started = await adapter.startAuth({ fresh: !!args.force });
         if (ctx.credentialStore && started?.auth_url) await writePendingAuth(ctx.credentialStore, started);
         return started;
       }
