@@ -38168,7 +38168,7 @@ function argWarnings(toolName, args) {
 
 // src/adapters/onedrive.js
 import { readFile as readFile4, writeFile as writeFile3, mkdir as mkdir3, rm } from "node:fs/promises";
-import { dirname as dirname4, join as join3 } from "node:path";
+import { dirname as dirname4, join as join3, resolve as resolvePath } from "node:path";
 import { randomBytes, createHash as createHash2 } from "node:crypto";
 import { tmpdir } from "node:os";
 var ExternalShareBlockedError = class extends AifsError {
@@ -38265,7 +38265,7 @@ var OneDriveAdapter = class {
     }
     this.credentialPath = join3(credentialStore, "onedrive.json");
     this.pkcePath = join3(credentialStore, "onedrive-pkce.json");
-    const pkceKey = createHash2("sha256").update(`${connection.tenant_id}:${connection.client_id}`).digest("hex").slice(0, 16);
+    const pkceKey = createHash2("sha256").update(`${connection.tenant_id}:${connection.client_id}:${resolvePath(credentialStore)}`).digest("hex").slice(0, 16);
     this.pkceTmpPath = join3(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
       this.tokens = JSON.parse(await readFile4(this.credentialPath, "utf-8"));
@@ -38349,21 +38349,38 @@ var OneDriveAdapter = class {
     }
     return null;
   }
-  /** Remove the persisted verifier from all paths (post-completion cleanup). */
+  /** Remove the persisted verifier from all paths (post-completion cleanup).
+   *  The Cowork mount can refuse deletes (finding 83), so when a file survives the
+   *  delete it is overwritten with an empty, expired record that _readVerifier and
+   *  startAuth ignore (finding 116: a used verifier was being reused). */
   async _clearVerifier() {
+    const removeFile = this._removeFile || ((p) => rm(p, { force: true }));
     for (const p of this._pkcePaths()) {
       try {
-        await rm(p, { force: true });
+        await removeFile(p);
       } catch {
       }
+      let survived = false;
+      try {
+        await readFile4(p, "utf-8");
+        survived = true;
+      } catch {
+      }
+      if (survived) {
+        try {
+          await writeFile3(p, JSON.stringify({ code_verifier: null, created: 0 }), "utf-8");
+        } catch {
+        }
+      }
     }
+    this._codeVerifier = null;
   }
-  async startAuth() {
+  async startAuth({ fresh = false } = {}) {
     let verifier = null;
     let reused = false;
     const existing = await this._readVerifier();
     const FRESH_MS = 10 * 60 * 1e3;
-    if (existing?.code_verifier && existing.created && Date.now() - existing.created < FRESH_MS) {
+    if (!fresh && existing?.code_verifier && existing.created && Date.now() - existing.created < FRESH_MS) {
       verifier = existing.code_verifier;
       reused = true;
     }
@@ -39918,7 +39935,7 @@ async function routeToolCall(adapter, toolName, args, ctx = {}) {
         }
         if (args.force && typeof adapter._clearVerifier === "function")
           await adapter._clearVerifier();
-        const started = await adapter.startAuth();
+        const started = await adapter.startAuth({ fresh: !!args.force });
         if (ctx.credentialStore && started?.auth_url)
           await writePendingAuth(ctx.credentialStore, started);
         return started;
