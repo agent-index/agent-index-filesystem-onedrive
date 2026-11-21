@@ -37698,10 +37698,62 @@ function argWarnings(toolName, args) {
 }
 
 // src/adapters/onedrive.js
-import { readFile as readFile2, writeFile, mkdir, rm } from "node:fs/promises";
+import { readFile as readFile2, writeFile, mkdir, rm, open, stat } from "node:fs/promises";
+import { writeFileSync as fsWriteFileSync } from "node:fs";
 import { dirname as dirname2, join } from "node:path";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+var CRED_LOCK_STALE_MS = 3e4;
+var CRED_LOCK_POLL_MS = 100;
+var CRED_LOCK_CONFIRM_MS = 150;
+var CRED_LOCK_TIMEOUT_MS = 3e4;
+var CredentialLockBusyError = class extends BackendError {
+  constructor(lockFile) {
+    super(`Timed out waiting for the credential-store lock (${lockFile}). Another agent-index process on this computer is refreshing your sign-in. Try again in a moment; you do not need to sign in again.`);
+    this.details = { ...this.details || {}, reason: "credential_lock_busy", needs_auth: false };
+  }
+};
+var CRED_PROC_NONCE = randomUUID();
+var _heldCredLocks = /* @__PURE__ */ new Set();
+var _credExitHandler = false;
+function _credPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+function credLockIsBreakable(info, now = Date.now()) {
+  if (!info || typeof info !== "object")
+    return true;
+  if (info.released === true)
+    return true;
+  if (info.pid === process.pid && info.nonce !== CRED_PROC_NONCE)
+    return true;
+  if (typeof info.pid === "number" && info.pid !== process.pid && !_credPidAlive(info.pid))
+    return true;
+  if (typeof info.ts !== "number" || now - info.ts > CRED_LOCK_STALE_MS)
+    return true;
+  return false;
+}
+function _credReleaseMarker() {
+  return JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ts: Date.now(), released: true });
+}
+function _installCredExitHandler() {
+  if (_credExitHandler)
+    return;
+  _credExitHandler = true;
+  process.on("exit", () => {
+    for (const f of _heldCredLocks) {
+      try {
+        fsWriteFileSync(f, _credReleaseMarker());
+      } catch {
+      }
+    }
+    _heldCredLocks.clear();
+  });
+}
 var ExternalShareBlockedError = class extends AifsError {
   constructor(subject, path, graph = {}, opts = {}) {
     const inferred = opts.policyInferred === true;
@@ -37820,7 +37872,13 @@ var OneDriveAdapter = class {
             user_identity: await this._getUserEmail(),
             expires_at: new Date(this.tokens.expires_at).toISOString()
           };
-        } catch {
+        } catch (e) {
+          if (e instanceof CredentialLockBusyError) {
+            return { authenticated: false, ...base, reason: "credential_lock_busy", needs_auth: false, detail: e.message };
+          }
+          if (e && e.details && e.details.reason === "expired" && e.details.refresh_detail) {
+            return { authenticated: false, ...base, reason: "expired", detail: e.message };
+          }
           return { authenticated: false, ...base, reason: "expired" };
         }
       }
@@ -39103,32 +39161,109 @@ var OneDriveAdapter = class {
     }
   }
   async _refreshToken() {
-    const tenant = this.connection.tenant_id;
-    const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-    const body = new URLSearchParams({
-      client_id: this.connection.client_id,
-      grant_type: "refresh_token",
-      refresh_token: this.tokens.refresh_token,
-      scope: SCOPES
+    const heldAccessToken = this.tokens ? this.tokens.access_token : void 0;
+    await this._withCredentialLock(async () => {
+      try {
+        const onDisk = JSON.parse(await readFile2(this.credentialPath, "utf-8"));
+        if (onDisk && onDisk.access_token)
+          this.tokens = onDisk;
+      } catch {
+      }
+      if (this.tokens && this.tokens.access_token && this.tokens.access_token !== heldAccessToken && this.tokens.expires_at && this.tokens.expires_at - 3e5 >= Date.now()) {
+        return;
+      }
+      if (!this.tokens || !this.tokens.refresh_token)
+        throw new NotAuthenticatedError("expired");
+      const tenant = this.connection.tenant_id;
+      const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+      const body = new URLSearchParams({
+        client_id: this.connection.client_id,
+        grant_type: "refresh_token",
+        refresh_token: this.tokens.refresh_token,
+        scope: SCOPES
+      });
+      const res = await fetch(tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        if (err.error === "invalid_grant") {
+          const e = new NotAuthenticatedError("expired");
+          e.message = "Not authenticated: expired. Microsoft rejected your saved agent-index sign-in. It was probably replaced (for example, used somewhere else) or revoked. Sign in again on this computer with @ai:member-bootstrap. Never copy your sign-in to another machine.";
+          e.details.refresh_detail = `Microsoft: ${err.error}${err.error_codes ? ` (AADSTS${err.error_codes[0]})` : ""}`;
+          throw e;
+        }
+        throw new NotAuthenticatedError(
+          `Token refresh failed: ${err.error_description || err.error || "unknown error"}`
+        );
+      }
+      const data = await res.json();
+      this.tokens = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || this.tokens.refresh_token,
+        expires_at: Date.now() + data.expires_in * 1e3
+      };
+      await this._writeCredential(this.tokens);
     });
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString()
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new NotAuthenticatedError(
-        `Token refresh failed: ${err.error_description || err.error || "unknown error"}`
-      );
+  }
+  /** Run fn while holding the credential-store lock (bug c1a2). */
+  async _withCredentialLock(fn) {
+    const lockFile = `${this.credentialPath}.lock`;
+    await mkdir(dirname2(lockFile), { recursive: true });
+    _installCredExitHandler();
+    const deadline = Date.now() + (this._credLockTimeoutMs || CRED_LOCK_TIMEOUT_MS);
+    let held = false;
+    while (!held) {
+      if (Date.now() > deadline)
+        throw new CredentialLockBusyError(lockFile);
+      const ticket = randomUUID();
+      const claim = JSON.stringify({ pid: process.pid, nonce: CRED_PROC_NONCE, ticket, ts: Date.now() });
+      try {
+        const fh = await open(lockFile, "wx");
+        await fh.writeFile(claim);
+        await fh.close();
+        held = true;
+        break;
+      } catch (e) {
+        if (e.code !== "EEXIST")
+          throw e;
+      }
+      let breakable;
+      try {
+        breakable = credLockIsBreakable(JSON.parse(await readFile2(lockFile, "utf-8")));
+      } catch {
+        try {
+          breakable = Date.now() - (await stat(lockFile)).mtimeMs > CRED_LOCK_STALE_MS;
+        } catch {
+          breakable = false;
+        }
+      }
+      if (breakable) {
+        try {
+          await writeFile(lockFile, claim);
+          await new Promise((r) => setTimeout(r, CRED_LOCK_CONFIRM_MS));
+          const now = JSON.parse(await readFile2(lockFile, "utf-8"));
+          if (now && now.ticket === ticket) {
+            held = true;
+            break;
+          }
+        } catch {
+        }
+      }
+      await new Promise((r) => setTimeout(r, CRED_LOCK_POLL_MS + Math.floor(Math.random() * 50)));
     }
-    const data = await res.json();
-    this.tokens = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || this.tokens.refresh_token,
-      expires_at: Date.now() + data.expires_in * 1e3
-    };
-    await this._writeCredential(this.tokens);
+    _heldCredLocks.add(lockFile);
+    try {
+      return await fn();
+    } finally {
+      _heldCredLocks.delete(lockFile);
+      try {
+        await writeFile(lockFile, _credReleaseMarker());
+      } catch {
+      }
+    }
   }
   async _getUserEmail() {
     try {
