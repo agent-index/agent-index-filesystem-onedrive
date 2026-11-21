@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
@@ -178,7 +178,9 @@ export class OneDriveAdapter {
     // fallback for environments where tmp isn't shared. Keyed by tenant+client
     // so concurrent installs in one sandbox don't collide. See startAuth/completeAuth.
     this.pkcePath = join(credentialStore, 'onedrive-pkce.json');
-    const pkceKey = createHash('sha256').update(`${connection.tenant_id}:${connection.client_id}`).digest('hex').slice(0, 16);
+    // Keyed by install too (finding 116): two installs on one tenant (an admin and a member)
+    // share a sandbox /tmp in Cowork and must not share a verifier.
+    const pkceKey = createHash('sha256').update(`${connection.tenant_id}:${connection.client_id}:${resolvePath(credentialStore)}`).digest('hex').slice(0, 16);
     this.pkceTmpPath = join(tmpdir(), `aifs-onedrive-pkce-${pkceKey}.json`);
     try {
       this.tokens = JSON.parse(await readFile(this.credentialPath, 'utf-8'));
@@ -266,14 +268,24 @@ export class OneDriveAdapter {
     return null;
   }
 
-  /** Remove the persisted verifier from all paths (post-completion cleanup). */
+  /** Remove the persisted verifier from all paths (post-completion cleanup).
+   *  The Cowork mount can refuse deletes (finding 83), so when a file survives the
+   *  delete it is overwritten with an empty, expired record that _readVerifier and
+   *  startAuth ignore (finding 116: a used verifier was being reused). */
   async _clearVerifier() {
+    const removeFile = this._removeFile || ((p) => rm(p, { force: true }));
     for (const p of this._pkcePaths()) {
-      try { await rm(p, { force: true }); } catch { /* */ }
+      try { await removeFile(p); } catch { /* fall through to the overwrite */ }
+      let survived = false;
+      try { await readFile(p, 'utf-8'); survived = true; } catch { /* gone */ }
+      if (survived) {
+        try { await writeFile(p, JSON.stringify({ code_verifier: null, created: 0 }), 'utf-8'); } catch { /* */ }
+      }
     }
+    this._codeVerifier = null;
   }
 
-  async startAuth() {
+  async startAuth({ fresh = false } = {}) {
     // pkcerestart (bug 20260615-8d20ea22-pkcerestart): TWO defenses.
     // (1) Persistence: write the verifier to a sandbox-local tmp path (primary)
     //     so it reliably survives between the separate start/complete exec
@@ -286,7 +298,8 @@ export class OneDriveAdapter {
     let reused = false;
     const existing = await this._readVerifier();
     const FRESH_MS = 10 * 60 * 1000;
-    if (existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
+    // fresh: a forced start (aifs_authenticate force:true) never reuses (finding 116).
+    if (!fresh && existing?.code_verifier && existing.created && (Date.now() - existing.created) < FRESH_MS) {
       verifier = existing.code_verifier;
       reused = true;
     }
@@ -381,6 +394,24 @@ export class OneDriveAdapter {
     };
   }
 
+  // ─── Org path seeding (CI-025, 2.8.0) ───────────────────────────────
+
+  /**
+   * Seed from the org map (shared library org-map.js). Plain paths already
+   * resolve on OneDrive, so paths are left alone. The org's own item ids are
+   * registered on the configured site drive, so a bare `id:{item}` for an org
+   * item resolves there directly instead of probing the member's own drive
+   * first (finding 63; technical design §2.6).
+   */
+  seedOrgPrefixes(prefixes) {
+    if (!prefixes || typeof prefixes !== 'object') return;
+    const configured = this._configuredDriveBase();
+    if (!configured || configured === '/me/drive') return;
+    for (const entry of Object.values(prefixes)) {
+      if (entry && entry.id && !this._anchorBase.has(entry.id)) this._anchorBase.set(entry.id, configured);
+    }
+  }
+
   // ─── File operations ─────────────────────────────────────────────────
 
   async read(path) {
@@ -415,6 +446,37 @@ export class OneDriveAdapter {
               `read: backend returned empty content for "${path}" but metadata reports ${declaredSize} bytes ` +
               `(retried ${READ_RETRY_BACKOFF_MS.length}x). Transient backend failure — retry; do NOT treat as empty.`,
               { path, declared_size: declaredSize, retries: READ_RETRY_BACKOFF_MS.length }
+            );
+          }
+        }
+      }
+
+      // CI-025 (2.8.0): size check on non-empty reads (parity with gdrive's 2.11.6
+      // read check, size only). A short body is re-read with backoff, then fails
+      // AIFS_READ_UNRELIABLE (reason size_mismatch). A failed metadata call skips
+      // the check; it never fails a read that succeeded.
+      if (buffer.length > 0) {
+        const metaSize = async () => {
+          try {
+            const r = await this._graph(`${addr.meta}?$select=size`);
+            const n = (await r.json())?.size;
+            return typeof n === 'number' ? n : null;
+          } catch { return null; }
+        };
+        let declared = await metaSize();
+        if (declared !== null && declared !== buffer.length) {
+          for (const delay of READ_RETRY_BACKOFF_MS) {
+            await aifsSleep(delay);
+            buffer = await fetchBuffer();
+            declared = await metaSize();
+            if (declared === null || declared === buffer.length) break;
+          }
+          if (declared !== null && declared !== buffer.length) {
+            throw new AifsError(
+              'AIFS_READ_UNRELIABLE',
+              `read: content returned for "${path}" doesn't match the file's current size (got ${buffer.length} bytes, ` +
+              `metadata reports ${declared}; retried ${READ_RETRY_BACKOFF_MS.length}x). Stale or incomplete read — retry; do NOT use this content.`,
+              { path, reason: 'size_mismatch', declared_size: declared, received_size: buffer.length, retries: READ_RETRY_BACKOFF_MS.length }
             );
           }
         }
@@ -1112,6 +1174,29 @@ export class OneDriveAdapter {
 
     const ncLower = nameContains ? String(nameContains).toLowerCase() : null;
     const results = [];
+    // B15 (CI-025): Graph search results usually carry parentReference.id but not
+    // parentReference.path, so a nested hit's folder is found by walking up from its
+    // parent id to the scope (one lookup per distinct folder, cached for this call).
+    const scopePath = isRoot ? '' : norm.replace(/\/$/, '');
+    const folderPath = new Map();
+    if (scopeId) folderPath.set(scopeId, scopePath);
+    const pathOfFolder = async (id, depth = 0) => {
+      if (!id) return null;
+      if (folderPath.has(id)) return folderPath.get(id);
+      if (depth > 32) return null;
+      let out = null;
+      try {
+        const res = await this._graph(`${base}/items/${id}?$select=id,name,root,parentReference`);
+        const d = await res.json();
+        if (d.root) out = isRoot ? '' : null; // the drive root, above a non-root scope
+        else {
+          const up = await pathOfFolder(d.parentReference?.id, depth + 1);
+          out = up === null ? null : `${up}/${d.name}`;
+        }
+      } catch { out = null; }
+      folderPath.set(id, out);
+      return out;
+    };
     for (const f of items) {
       const isFolder = !!f.folder;
       if (type === 'folder' && !isFolder) continue;
@@ -1120,10 +1205,25 @@ export class OneDriveAdapter {
       let p = this._idToPath(f.id);
       if (!p) {
         const baseScope = isRoot ? '' : norm.replace(/\/$/, '');
-        p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        // CI-025: a name search is recursive, so a hit may sit below the scope.
+        // For a plain scope, use the item's parent path (parentReference.path,
+        // "/drive/root:/a/b" or "/drives/{id}/root:/a/b") when Graph returns it.
+        const parentPath = typeof f.parentReference?.path === 'string'
+          ? (() => { try { return decodeURIComponent(f.parentReference.path.replace(/^.*?root:/, '')); } catch { return null; } })()
+          : null;
+        if (!this._isAnchor(scope) && parentPath !== null && (parentPath === '' || parentPath.startsWith('/'))) {
+          p = `${parentPath.replace(/\/$/, '')}/${f.name}`;
+        } else if (nameContains && f.parentReference?.id) {
+          const up = await pathOfFolder(f.parentReference.id);
+          p = up === null ? null : `${up}/${f.name}`;
+        } else {
+          p = this._isAnchor(scope) ? `${norm}/${f.name}` : `${baseScope}/${f.name}`;
+        }
       }
+      if (p === null) continue; // its folder couldn't be placed under the scope: never report a wrong path
       results.push({
         path: p,
+        id: f.id,
         type: isFolder ? 'folder' : 'file',
         name: f.name,
         owner: f.createdBy?.user?.email || f.createdBy?.user?.displayName || null,

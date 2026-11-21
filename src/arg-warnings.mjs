@@ -19,7 +19,7 @@ export const TOOL_ARGS = Object.freeze({
   aifs_delete: ['path'],
   aifs_copy: ['source', 'destination'],
   aifs_auth_status: [],
-  aifs_authenticate: ['action', 'auth_code'],
+  aifs_authenticate: ['action', 'auth_code', 'force'],
   aifs_resolve_site: ['site_url'],
   // ref, plus the aliases routeToolCall coalesces into it
   aifs_resolve_identity: ['ref', 'email', 'subject', 'identity', 'upn', 'user', 'member', 'recipient'],
